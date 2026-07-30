@@ -637,8 +637,14 @@ export default function Home() {
         workerRef.current = worker;
 
         const timeout = window.setTimeout(() => {
-          reject(new Error("AI 모델 준비 시간이 초과되었습니다."));
-        }, 40_000);
+          worker.terminate();
+          if (workerRef.current === worker) workerRef.current = null;
+          setModelState("error");
+          const timeoutMessage =
+            "AI 모델 준비 시간이 초과되었습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.";
+          setModelMessage(timeoutMessage);
+          reject(new Error(timeoutMessage));
+        }, 90_000);
 
         worker.onmessage = (
           event: MessageEvent<
@@ -655,6 +661,9 @@ export default function Home() {
             return;
           }
           if (event.data.type === "error") {
+            window.clearTimeout(timeout);
+            worker.terminate();
+            if (workerRef.current === worker) workerRef.current = null;
             workerBusyRef.current = false;
             setModelState("error");
             setModelMessage(event.data.message);
@@ -664,12 +673,17 @@ export default function Home() {
           handleVisionResultRef.current(event.data);
         };
 
-        worker.onerror = () => {
+        worker.onerror = (event) => {
           window.clearTimeout(timeout);
+          worker.terminate();
+          if (workerRef.current === worker) workerRef.current = null;
           workerBusyRef.current = false;
           setModelState("error");
-          setModelMessage("이 기기에서 AI 모델을 시작하지 못했습니다.");
-          reject(new Error("AI worker failed"));
+          const detail = event.message
+            ? `AI 실행 환경 오류: ${event.message}`
+            : "이 기기에서 AI 모델을 시작하지 못했습니다.";
+          setModelMessage(detail);
+          reject(new Error(detail));
         };
 
         worker.postMessage({
@@ -1067,15 +1081,14 @@ export default function Home() {
         );
       } else {
         setModelMessage(
-          modelState === "error"
-            ? "AI 모델을 준비하지 못했습니다. 네트워크와 기기 지원을 확인해 주세요."
+          error instanceof Error && error.message.startsWith("AI 모델")
+            ? error.message
             : "카메라를 시작하지 못했습니다. 다른 앱이 카메라를 사용 중인지 확인해 주세요.",
         );
       }
     }
   }, [
     ensureVisionWorker,
-    modelState,
     showToast,
     startRenderAndInferenceLoops,
   ]);

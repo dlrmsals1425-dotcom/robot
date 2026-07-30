@@ -61,11 +61,12 @@ test("ships the PWA shell and pinned local AI assets", async () => {
     requiredFiles.map((path) => access(new URL(path, templateRoot))),
   );
 
-  const [manifest, serviceWorker, page, packageJson, poseModel] =
+  const [manifest, serviceWorker, page, visionWorker, packageJson, poseModel] =
     await Promise.all([
       readFile(new URL("public/manifest.webmanifest", templateRoot), "utf8"),
       readFile(new URL("public/sw.js", templateRoot), "utf8"),
       readFile(new URL("app/page.tsx", templateRoot), "utf8"),
+      readFile(new URL("app/vision.worker.ts", templateRoot), "utf8"),
       readFile(new URL("package.json", templateRoot), "utf8"),
       stat(new URL("public/models/pose_landmarker_lite.task", templateRoot)),
     ]);
@@ -73,7 +74,12 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   assert.match(manifest, /"display": "standalone"/);
   assert.match(serviceWorker, /notificationclick/);
   assert.match(serviceWorker, /showNotification/);
+  assert.match(serviceWorker, /event\.request\.mode === "navigate"/);
   assert.match(page, /FaceDetector|blaze_face_full_range|얼굴/);
+  assert.match(
+    visionWorker,
+    /FilesetResolver\.forVisionTasks\([\s\S]*?true,[\s\S]*?\)/,
+  );
   assert.match(packageJson, /"@mediapipe\/tasks-vision": "0\.10\.35"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.ok(poseModel.size > 1_000_000);

@@ -1,4 +1,4 @@
-const CACHE_NAME = "safebot-shell-v1";
+const CACHE_NAME = "safebot-shell-v2";
 const APP_SHELL = ["/", "/manifest.webmanifest", "/icons/icon-192.png"];
 
 self.addEventListener("install", (event) => {
@@ -39,7 +39,13 @@ self.addEventListener("fetch", (event) => {
         }
         return response;
       })
-      .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/"))),
+      .catch(() =>
+        caches.match(event.request).then((cached) => {
+          if (cached) return cached;
+          if (event.request.mode === "navigate") return caches.match("/");
+          return Response.error();
+        }),
+      ),
   );
 });
 

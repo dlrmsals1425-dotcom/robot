@@ -75,6 +75,7 @@ function serializePoses(poses: NormalizedLandmark[][]) {
 async function initialize(baseUrl: string) {
   const vision = await FilesetResolver.forVisionTasks(
     `${baseUrl}/mediapipe/wasm`,
+    true,
   );
 
   const [pose, face, objects] = await Promise.all([
