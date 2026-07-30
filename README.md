@@ -32,6 +32,29 @@ npm run dev
 
 브라우저에서 `http://localhost:3000`을 열고 카메라와 알림 권한을 허용합니다. 배포 환경에서는 카메라와 서비스 워커를 위해 HTTPS가 필요합니다.
 
+## Cloudflare Workers 배포
+
+이 저장소는 OpenAI Sites와 별개로 Cloudflare Workers에 배포할 수 있습니다. 빌드가 생성하는 `dist/server/wrangler.json`을 사용하므로 루트에 별도의 Cloudflare 비밀키나 계정 ID를 커밋하지 않습니다.
+
+Cloudflare Workers Builds에서 GitHub 저장소를 연결할 때 다음 값을 사용합니다.
+
+| 항목 | 값 |
+| --- | --- |
+| GitHub 저장소 | `dlrmsals1425-dotcom/robot` |
+| Worker 이름 | `safebot-patrol-mvp` |
+| 프로덕션 브랜치 | `main` |
+| 루트 디렉터리 | 비워두기 |
+| 빌드 명령 | `npm run build` |
+| 배포 명령 | `npm run deploy:cloudflare` |
+| 비프로덕션 배포 명령 | `npm run preview:cloudflare` |
+
+Cloudflare 대시보드의 자동 생성 API 토큰을 사용하면 토큰을 저장소나 채팅에 노출하지 않고 배포할 수 있습니다. 로컬에서 이미 Wrangler 로그인을 마쳤다면 다음과 같이 직접 배포할 수도 있습니다.
+
+```bash
+npm run build
+npm run deploy:cloudflare
+```
+
 ## AI 자산
 
 모델과 WASM 런타임을 `public/` 아래에 고정해 런타임 CDN 버전 변경에 영향을 받지 않도록 했습니다.
