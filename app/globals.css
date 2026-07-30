@@ -689,24 +689,32 @@ a:focus-visible {
 }
 
 .fall-panel {
-  position: absolute;
-  z-index: 8;
-  inset: 0;
-  display: flex;
+  position: fixed;
+  z-index: 80;
+  top: 82px;
+  right: 22px;
+  display: grid;
+  width: min(440px, calc(100vw - 44px));
+  max-height: calc(100svh - 104px);
+  grid-template-columns: 68px minmax(0, 1fr);
   align-items: center;
-  justify-content: center;
-  gap: clamp(24px, 5vw, 58px);
-  padding: clamp(24px, 5vw, 52px);
-  background:
-    linear-gradient(90deg, rgb(20 13 5 / 89%), rgb(39 19 4 / 75%)),
-    radial-gradient(circle at 50% 50%, rgb(255 181 88 / 18%), transparent 60%);
-  backdrop-filter: blur(7px);
+  gap: 13px;
+  padding: 14px;
+  overflow: auto;
+  border: 1px solid rgb(255 181 88 / 42%);
+  border-radius: 17px;
+  background: rgb(35 21 8 / 93%);
+  color: white;
+  box-shadow: 0 16px 42px rgb(0 0 0 / 36%);
+  text-align: left;
+  backdrop-filter: blur(12px);
+  animation: toast-in 220ms ease-out;
 }
 
 .countdown-ring {
   position: relative;
-  width: clamp(112px, 15vw, 152px);
-  height: clamp(112px, 15vw, 152px);
+  width: 68px;
+  height: 68px;
   flex: 0 0 auto;
 }
 
@@ -744,7 +752,7 @@ a:focus-visible {
 
 .countdown-ring strong {
   align-self: center;
-  font-size: clamp(43px, 6vw, 66px);
+  font-size: 29px;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.09em;
   line-height: 1;
@@ -752,14 +760,14 @@ a:focus-visible {
 
 .countdown-ring span {
   align-self: center;
-  margin: 30px 0 0 6px;
+  margin: 17px 0 0 4px;
   color: #e7b678;
-  font-size: 12px;
+  font-size: 9px;
   font-weight: 800;
 }
 
 .fall-copy {
-  max-width: 500px;
+  min-width: 0;
 }
 
 .alert-kicker {
@@ -773,8 +781,8 @@ a:focus-visible {
 }
 
 .fall-copy h2 {
-  margin: 9px 0 7px;
-  font-size: clamp(23px, 3.5vw, 39px);
+  margin: 6px 0 4px;
+  font-size: 17px;
   letter-spacing: -0.045em;
   line-height: 1.14;
 }
@@ -782,30 +790,34 @@ a:focus-visible {
 .fall-copy p {
   margin: 0;
   color: #e5d3bd;
-  font-size: 12px;
-  line-height: 1.6;
+  font-size: 10.5px;
+  line-height: 1.5;
 }
 
 .fall-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 22px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 10px;
 }
 
 .fall-actions button {
   display: inline-flex;
-  min-height: 43px;
+  min-width: 0;
+  min-height: 36px;
   align-items: center;
+  justify-content: center;
   gap: 7px;
-  padding: 0 13px;
+  padding: 0 7px;
   border: 1px solid rgb(255 255 255 / 16%);
-  border-radius: 12px;
+  border-radius: 10px;
   background: rgb(255 255 255 / 8%);
   color: white;
   cursor: pointer;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 750;
+  line-height: 1.2;
+  white-space: normal;
 }
 
 .fall-actions button:hover {
@@ -819,29 +831,36 @@ a:focus-visible {
 }
 
 .emergency-panel {
-  position: absolute;
-  z-index: 9;
-  inset: 0;
+  position: fixed;
+  z-index: 81;
+  top: 82px;
+  right: 22px;
   display: flex;
+  width: min(410px, calc(100vw - 44px));
+  max-height: calc(100svh - 104px);
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 32px;
-  background:
-    radial-gradient(circle at 50% 40%, rgb(255 122 114 / 25%), transparent 30%),
-    rgb(54 9 9 / 92%);
-  text-align: center;
-  backdrop-filter: blur(8px);
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 16px;
+  overflow: auto;
+  border: 1px solid rgb(255 139 132 / 42%);
+  border-radius: 17px;
+  background: rgb(54 9 9 / 93%);
+  color: white;
+  box-shadow: 0 16px 42px rgb(0 0 0 / 38%);
+  text-align: left;
+  backdrop-filter: blur(12px);
+  animation: toast-in 220ms ease-out;
 }
 
 .emergency-icon {
   display: grid;
-  width: 68px;
-  height: 68px;
-  margin-bottom: 15px;
+  width: 42px;
+  height: 42px;
+  margin-bottom: 10px;
   place-items: center;
   border: 1px solid rgb(255 255 255 / 20%);
-  border-radius: 23px;
+  border-radius: 13px;
   background: rgb(255 255 255 / 9%);
   color: #ff8b84;
   box-shadow: 0 0 45px rgb(255 99 90 / 20%);
@@ -855,17 +874,17 @@ a:focus-visible {
 }
 
 .emergency-panel h2 {
-  margin: 10px 0 7px;
-  font-size: clamp(25px, 3.5vw, 40px);
+  margin: 7px 0 5px;
+  font-size: 18px;
   letter-spacing: -0.045em;
 }
 
 .emergency-panel p {
-  max-width: 570px;
-  margin: 0 0 20px;
+  max-width: 360px;
+  margin: 0 0 13px;
   color: #edc8c5;
-  font-size: 12px;
-  line-height: 1.65;
+  font-size: 10.5px;
+  line-height: 1.55;
 }
 
 .recovery-banner {
@@ -1893,24 +1912,37 @@ a:focus-visible {
   }
 
   .fall-panel {
-    flex-direction: column;
-    gap: 16px;
-    padding: 23px 18px;
-    text-align: center;
+    top: calc(74px + env(safe-area-inset-top));
+    right: 10px;
+    left: 10px;
+    width: auto;
+    max-height: calc(
+      100svh - 164px - env(safe-area-inset-top) -
+        env(safe-area-inset-bottom)
+    );
+    grid-template-columns: 52px minmax(0, 1fr);
+    gap: 9px;
+    padding: 11px;
+    text-align: left;
   }
 
   .countdown-ring {
-    width: 112px;
-    height: 112px;
+    width: 52px;
+    height: 52px;
   }
 
   .countdown-ring strong {
-    font-size: 49px;
+    font-size: 23px;
+  }
+
+  .countdown-ring span {
+    margin-top: 13px;
+    font-size: 8px;
   }
 
   .fall-copy h2 {
-    margin-block: 7px 5px;
-    font-size: 22px;
+    margin-block: 4px 3px;
+    font-size: 15px;
   }
 
   .fall-copy p {
@@ -1918,24 +1950,34 @@ a:focus-visible {
   }
 
   .fall-actions {
-    justify-content: center;
-    margin-top: 14px;
+    margin-top: 8px;
   }
 
   .fall-actions button {
-    min-height: 42px;
-    padding-inline: 11px;
+    min-height: 34px;
+    gap: 4px;
+    padding-inline: 5px;
+    font-size: 9px;
   }
 
   .emergency-panel {
-    padding: 25px 21px;
+    top: calc(74px + env(safe-area-inset-top));
+    right: 10px;
+    left: 10px;
+    width: auto;
+    max-height: calc(
+      100svh - 164px - env(safe-area-inset-top) -
+        env(safe-area-inset-bottom)
+    );
+    padding: 13px;
   }
 
   .emergency-panel h2 {
-    font-size: 25px;
+    font-size: 17px;
   }
 
   .emergency-panel p {
+    margin-bottom: 10px;
     font-size: 10px;
   }
 
@@ -2167,6 +2209,18 @@ a:focus-visible {
 
   .camera-signals span {
     font-size: 8px;
+  }
+
+  .fall-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .fall-actions button {
+    min-height: 44px;
+  }
+
+  .fall-actions button.urgent {
+    grid-column: 1 / -1;
   }
 
   .metric-card {

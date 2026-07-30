@@ -34,6 +34,17 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  analyzeFallPose,
+  createVerificationProgress,
+  FALL_MAX_POSITIVE_GAP_MS,
+  poseCenterDistance,
+  type FallAnalysis,
+  type PoseCenter,
+  type PosePoint,
+  type VerificationProgress,
+  updateVerificationProgress,
+} from "./fall-detection";
 
 type AppView = "patrol" | "history" | "guide";
 type CameraState = "idle" | "starting" | "running" | "error";
@@ -44,13 +55,6 @@ type EventStatus =
   | "recovered"
   | "false_positive"
   | "interrupted";
-
-type PosePoint = {
-  x: number;
-  y: number;
-  z: number;
-  visibility: number;
-};
 
 type DetectionBox = {
   originX: number;
@@ -103,10 +107,16 @@ type VisionStats = {
 };
 
 const FALL_CONFIRMATION_MS = 10_000;
-const SUSPECT_STABILITY_MS = 900;
+const SUSPECT_STABILITY_MS = 1_800;
+const MIN_SUSPECT_SAMPLES = 6;
+const MAX_CANDIDATE_DISTANCE = 0.16;
+const RECOVERY_CANDIDATE_DISTANCE = 0.28;
 const RECOVERY_STABILITY_MS = 850;
 const LOST_TRACKING_MS = 1_100;
+const MAX_VERIFICATION_WALL_MS = 20_000;
 const STORAGE_KEY = "safebot-safety-events-v1";
+const PERSON_DETECTION_COLOR = "#ff4d5a";
+const OBJECT_DETECTION_COLOR = "#7bd4ff";
 
 const POSE_CONNECTIONS = [
   [11, 12],
@@ -157,75 +167,6 @@ function formatDate(iso: string) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
-}
-
-function getPoseBounds(pose: PosePoint[]) {
-  const visible = pose.filter(
-    (point) =>
-      point.visibility > 0.45 &&
-      Number.isFinite(point.x) &&
-      Number.isFinite(point.y),
-  );
-
-  if (visible.length < 8) return null;
-
-  const xs = visible.map((point) => point.x);
-  const ys = visible.map((point) => point.y);
-  return {
-    minX: Math.min(...xs),
-    maxX: Math.max(...xs),
-    minY: Math.min(...ys),
-    maxY: Math.max(...ys),
-  };
-}
-
-function analyzeFallPose(pose: PosePoint[]) {
-  const required = [11, 12, 23, 24].map((index) => pose[index]);
-  if (
-    required.some(
-      (point) =>
-        !point ||
-        point.visibility < 0.52 ||
-        !Number.isFinite(point.x) ||
-        !Number.isFinite(point.y),
-    )
-  ) {
-    return { isLying: false, confidence: 0 };
-  }
-
-  const [leftShoulder, rightShoulder, leftHip, rightHip] = required;
-  const shoulder = {
-    x: (leftShoulder.x + rightShoulder.x) / 2,
-    y: (leftShoulder.y + rightShoulder.y) / 2,
-  };
-  const hip = {
-    x: (leftHip.x + rightHip.x) / 2,
-    y: (leftHip.y + rightHip.y) / 2,
-  };
-  const dx = Math.abs(hip.x - shoulder.x);
-  const dy = Math.abs(hip.y - shoulder.y);
-  const angleFromHorizontal =
-    (Math.atan2(dy, Math.max(dx, 0.0001)) * 180) / Math.PI;
-  const bounds = getPoseBounds(pose);
-
-  if (!bounds) return { isLying: false, confidence: 0 };
-
-  const width = Math.max(bounds.maxX - bounds.minX, 0.001);
-  const height = Math.max(bounds.maxY - bounds.minY, 0.001);
-  const aspectRatio = width / height;
-  const horizontalScore = clamp((55 - angleFromHorizontal) / 35, 0, 1);
-  const aspectScore = clamp((aspectRatio - 0.78) / 0.62, 0, 1);
-  const lowerFrameScore = clamp((hip.y - 0.32) / 0.42, 0, 1);
-  const confidence =
-    horizontalScore * 0.5 + aspectScore * 0.35 + lowerFrameScore * 0.15;
-
-  return {
-    isLying:
-      angleFromHorizontal < 42 &&
-      aspectRatio > 0.95 &&
-      confidence >= 0.58,
-    confidence,
-  };
 }
 
 function eventStatusLabel(status: EventStatus) {
@@ -284,6 +225,7 @@ export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const analysisCanvasRef = useRef<HTMLCanvasElement>(null);
+  const alertPopupRef = useRef<HTMLDivElement>(null);
   const pixelCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workerRef = useRef<Worker | null>(null);
@@ -295,8 +237,15 @@ export default function Home() {
   const alertPhaseRef = useRef<AlertPhase>("idle");
   const verificationStartedRef = useRef<number | null>(null);
   const suspectStartedRef = useRef<number | null>(null);
+  const suspectLastPositiveRef = useRef<number | null>(null);
+  const suspectSamplesRef = useRef(0);
+  const suspectCandidateRef = useRef<PoseCenter | null>(null);
   const uprightStartedRef = useRef<number | null>(null);
   const lastPositiveRef = useRef<number | null>(null);
+  const verificationProgressRef = useRef<VerificationProgress>(
+    createVerificationProgress(),
+  );
+  const verificationCandidateRef = useRef<PoseCenter | null>(null);
   const emergencyTriggeredRef = useRef(false);
   const manualScenarioRef = useRef(false);
   const eventsRef = useRef<SafetyEvent[]>([]);
@@ -408,8 +357,13 @@ export default function Home() {
   const resetDetectionState = useCallback(() => {
     verificationStartedRef.current = null;
     suspectStartedRef.current = null;
+    suspectLastPositiveRef.current = null;
+    suspectSamplesRef.current = 0;
+    suspectCandidateRef.current = null;
     uprightStartedRef.current = null;
     lastPositiveRef.current = null;
+    verificationProgressRef.current = createVerificationProgress();
+    verificationCandidateRef.current = null;
     emergencyTriggeredRef.current = false;
     manualScenarioRef.current = false;
     setManualScenario(false);
@@ -420,20 +374,27 @@ export default function Home() {
   const finishEmergency = useCallback(async () => {
     if (emergencyTriggeredRef.current) return;
     emergencyTriggeredRef.current = true;
-    const duration = verificationStartedRef.current
-      ? Math.max(
-          10,
-          Math.round(
-            (performance.now() - verificationStartedRef.current) / 1000,
-          ),
-        )
-      : 10;
+    const duration =
+      manualScenarioRef.current && verificationStartedRef.current
+        ? Math.max(
+            10,
+            Math.round(
+              (performance.now() - verificationStartedRef.current) / 1000,
+            ),
+          )
+        : Math.max(
+            10,
+            Math.round(
+              verificationProgressRef.current.confirmedMs / 1000,
+            ),
+          );
+    setPhase("alerted");
+    setCountdown(0);
+
     const notificationSent = await sendDeviceNotification();
     const permission =
       "Notification" in window ? Notification.permission : "denied";
 
-    setPhase("alerted");
-    setCountdown(0);
     addEvent(
       "emergency",
       "쓰러짐 의심 · 관제 확인 필요",
@@ -460,29 +421,37 @@ export default function Home() {
   ]);
 
   const beginVerification = useCallback(
-    (confidence: number, isManual = false) => {
+    (
+      confidence: number,
+      isManual = false,
+      candidateCenter: PoseCenter | null = null,
+    ) => {
       if (alertPhaseRef.current !== "idle") return;
       const now = performance.now();
       verificationStartedRef.current = now;
       lastPositiveRef.current = now;
+      verificationProgressRef.current = createVerificationProgress(
+        isManual ? null : now,
+      );
+      verificationCandidateRef.current = candidateCenter;
       emergencyTriggeredRef.current = false;
       manualScenarioRef.current = isManual;
       setManualScenario(isManual);
       setFallConfidence(confidence);
       setCountdown(10);
       setPhase("verifying");
-      showToast(
-        isManual
-          ? "10초 알림 흐름 테스트를 시작했습니다."
-          : "누운 자세를 확인하고 있습니다.",
-      );
     },
-    [setPhase, showToast],
+    [setPhase],
   );
 
   const resolveVerification = useCallback(
     (status: "recovered" | "false_positive" | "interrupted") => {
-      if (alertPhaseRef.current !== "verifying") return;
+      if (
+        alertPhaseRef.current !== "verifying" ||
+        emergencyTriggeredRef.current
+      ) {
+        return;
+      }
       const duration = verificationStartedRef.current
         ? Math.max(
             1,
@@ -560,68 +529,203 @@ export default function Home() {
         (detection) => detection.categoryName !== "person",
       ).length;
       const analyses = result.poses.map(analyzeFallPose);
-      const strongest = analyses.reduce(
+      const emptyAnalysis: FallAnalysis = {
+        isLying: false,
+        isUpright: false,
+        confidence: 0,
+        center: null,
+      };
+      const strongestAnalysis = analyses.reduce<FallAnalysis>(
         (best, current) =>
           current.confidence > best.confidence ? current : best,
-        { isLying: false, confidence: 0 },
+        emptyAnalysis,
       );
+      const strongestLying = analyses
+        .filter((analysis) => analysis.isLying && analysis.center)
+        .reduce<FallAnalysis | null>(
+          (best, current) =>
+            !best || current.confidence > best.confidence ? current : best,
+          null,
+        );
+
+      let closestTrackedLying: FallAnalysis | null = null;
+      const continuityCenter =
+        alertPhaseRef.current === "verifying"
+          ? verificationCandidateRef.current
+          : alertPhaseRef.current === "idle"
+            ? suspectCandidateRef.current
+            : null;
+      if (continuityCenter) {
+        let closestDistance = MAX_CANDIDATE_DISTANCE;
+        for (const analysis of analyses) {
+          if (!analysis.isLying || !analysis.center) continue;
+          const distance = poseCenterDistance(
+            continuityCenter,
+            analysis.center,
+          );
+          if (distance <= closestDistance) {
+            closestDistance = distance;
+            closestTrackedLying = analysis;
+          }
+        }
+      }
+      const activeLying =
+        alertPhaseRef.current === "verifying" &&
+        verificationCandidateRef.current
+          ? closestTrackedLying
+          : alertPhaseRef.current === "idle" &&
+              suspectCandidateRef.current
+            ? closestTrackedLying ?? strongestLying
+            : strongestLying;
 
       setVisionStats({
         people,
         objects: nonPeople,
-        confidence: strongest.confidence,
+        confidence:
+          strongestLying?.confidence ?? strongestAnalysis.confidence,
         latencyMs: result.latencyMs,
       });
 
       if (manualScenarioRef.current) return;
 
       const now = performance.now();
-      if (strongest.isLying) {
+      if (activeLying?.center) {
         lastPositiveRef.current = now;
         uprightStartedRef.current = null;
-        setFallConfidence(strongest.confidence);
+        setFallConfidence(activeLying.confidence);
 
-        if (suspectStartedRef.current === null) {
-          suspectStartedRef.current = now;
+        if (alertPhaseRef.current === "verifying") {
+          if (verificationCandidateRef.current) {
+            verificationCandidateRef.current = {
+              x:
+                verificationCandidateRef.current.x * 0.8 +
+                activeLying.center.x * 0.2,
+              y:
+                verificationCandidateRef.current.y * 0.8 +
+                activeLying.center.y * 0.2,
+            };
+          }
+
+          verificationProgressRef.current = updateVerificationProgress(
+            verificationProgressRef.current,
+            now,
+            true,
+          );
+          const verifiedMs =
+            verificationProgressRef.current.confirmedMs;
+          setCountdown(
+            Math.max(
+              0,
+              Math.ceil((FALL_CONFIRMATION_MS - verifiedMs) / 1000),
+            ),
+          );
+          if (verifiedMs >= FALL_CONFIRMATION_MS) {
+            void finishEmergency();
+          }
+          return;
         }
 
+        if (alertPhaseRef.current !== "idle") return;
+
+        const previousCandidate = suspectCandidateRef.current;
+        const previousPositive = suspectLastPositiveRef.current;
+        const startsNewCandidate =
+          suspectStartedRef.current === null ||
+          previousPositive === null ||
+          now - previousPositive > FALL_MAX_POSITIVE_GAP_MS ||
+          poseCenterDistance(previousCandidate, activeLying.center) >
+            MAX_CANDIDATE_DISTANCE;
+
+        if (startsNewCandidate) {
+          suspectStartedRef.current = now;
+          suspectSamplesRef.current = 1;
+          suspectCandidateRef.current = activeLying.center;
+        } else {
+          suspectSamplesRef.current += 1;
+          if (previousCandidate) {
+            suspectCandidateRef.current = {
+              x: previousCandidate.x * 0.75 + activeLying.center.x * 0.25,
+              y: previousCandidate.y * 0.75 + activeLying.center.y * 0.25,
+            };
+          }
+        }
+        suspectLastPositiveRef.current = now;
+
         if (
-          alertPhaseRef.current === "idle" &&
-          now - suspectStartedRef.current >= SUSPECT_STABILITY_MS
+          suspectStartedRef.current !== null &&
+          now - suspectStartedRef.current >= SUSPECT_STABILITY_MS &&
+          suspectSamplesRef.current >= MIN_SUSPECT_SAMPLES
         ) {
-          beginVerification(strongest.confidence);
+          beginVerification(
+            activeLying.confidence,
+            false,
+            suspectCandidateRef.current,
+          );
         }
         return;
       }
 
       suspectStartedRef.current = null;
+      suspectLastPositiveRef.current = null;
+      suspectSamplesRef.current = 0;
+      suspectCandidateRef.current = null;
       if (alertPhaseRef.current !== "verifying") return;
 
-      if (result.poses.length === 0) {
+      verificationProgressRef.current = updateVerificationProgress(
+        verificationProgressRef.current,
+        now,
+        false,
+      );
+      const matchingUpright = analyses.some(
+        (analysis) =>
+          analysis.isUpright &&
+          analysis.center &&
+          (!verificationCandidateRef.current ||
+            poseCenterDistance(
+              verificationCandidateRef.current,
+              analysis.center,
+            ) <= RECOVERY_CANDIDATE_DISTANCE),
+      );
+
+      if (matchingUpright && uprightStartedRef.current === null) {
+        uprightStartedRef.current = now;
+      }
+      if (
+        matchingUpright &&
+        uprightStartedRef.current !== null &&
+        now - uprightStartedRef.current >= RECOVERY_STABILITY_MS
+      ) {
+        resolveVerification("recovered");
+        return;
+      }
+      if (!matchingUpright) {
+        uprightStartedRef.current = null;
         if (
           lastPositiveRef.current &&
           now - lastPositiveRef.current > LOST_TRACKING_MS
         ) {
           resolveVerification("interrupted");
         }
-        return;
-      }
-
-      if (uprightStartedRef.current === null) {
-        uprightStartedRef.current = now;
-      }
-      if (
-        now - uprightStartedRef.current >= RECOVERY_STABILITY_MS
-      ) {
-        resolveVerification("recovered");
       }
     },
-    [beginVerification, resolveVerification],
+    [
+      beginVerification,
+      finishEmergency,
+      resolveVerification,
+    ],
   );
 
   useEffect(() => {
     handleVisionResultRef.current = handleVisionResult;
   }, [handleVisionResult]);
+
+  useEffect(() => {
+    if (alertPhase !== "verifying" && alertPhase !== "alerted") return;
+    const frame = window.requestAnimationFrame(() => {
+      alertPopupRef.current?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [alertPhase]);
 
   const ensureVisionWorker = useCallback(() => {
     if (workerReadyRef.current) return workerReadyRef.current;
@@ -871,7 +975,9 @@ export default function Home() {
         if (!detection.boundingBox) continue;
         const { originX, originY, width, height } = detection.boundingBox;
         const isPerson = detection.categoryName === "person";
-        const color = isPerson ? "#8cf2b2" : "#7bd4ff";
+        const color = isPerson
+          ? PERSON_DETECTION_COLOR
+          : OBJECT_DETECTION_COLOR;
         const x = originX * scaleX;
         const y = originY * scaleY;
         const boxWidth = width * scaleX;
@@ -890,17 +996,9 @@ export default function Home() {
         context.fillText(text, x + 7, Math.max(2, y - 24));
       }
 
-      const pose = result.poses[0];
-      if (pose) {
-        const fall = analyzeFallPose(pose);
-        const poseColor =
-          alertPhaseRef.current === "alerted"
-            ? "#ff6b64"
-            : fall.isLying
-              ? "#ffb558"
-              : "#9cf6bd";
-        context.strokeStyle = poseColor;
-        context.fillStyle = poseColor;
+      for (const pose of result.poses) {
+        context.strokeStyle = PERSON_DETECTION_COLOR;
+        context.fillStyle = PERSON_DETECTION_COLOR;
         context.lineWidth = Math.max(2.5, canvas.width / 360);
 
         for (const [start, end] of POSE_CONNECTIONS) {
@@ -1149,13 +1247,34 @@ export default function Home() {
       const now = performance.now();
       if (
         !manualScenarioRef.current &&
+        now - startedAt > MAX_VERIFICATION_WALL_MS &&
+        verificationProgressRef.current.confirmedMs < FALL_CONFIRMATION_MS
+      ) {
+        resolveVerification("interrupted");
+        return;
+      }
+      if (
+        !manualScenarioRef.current &&
         lastPositiveRef.current &&
+        uprightStartedRef.current === null &&
         now - lastPositiveRef.current > LOST_TRACKING_MS
       ) {
         resolveVerification("interrupted");
         return;
       }
-      const elapsed = now - startedAt;
+      if (
+        !manualScenarioRef.current &&
+        verificationProgressRef.current.negativeStartedAt !== null
+      ) {
+        verificationProgressRef.current = updateVerificationProgress(
+          verificationProgressRef.current,
+          now,
+          false,
+        );
+      }
+      const elapsed = manualScenarioRef.current
+        ? now - startedAt
+        : verificationProgressRef.current.confirmedMs;
       const remaining = Math.max(
         0,
         Math.ceil((FALL_CONFIRMATION_MS - elapsed) / 1000),
@@ -1498,83 +1617,6 @@ export default function Home() {
                         </span>
                       </div>
                     </>
-                  )}
-
-                  {alertPhase === "verifying" && (
-                    <div className="fall-panel" role="alert" aria-live="assertive">
-                      <div className="countdown-ring">
-                        <svg viewBox="0 0 120 120" aria-hidden="true">
-                          <circle cx="60" cy="60" r="52" />
-                          <circle
-                            className="progress"
-                            cx="60"
-                            cy="60"
-                            r="52"
-                            style={{
-                              strokeDashoffset:
-                                327 - 327 * (countdown / 10),
-                            }}
-                          />
-                        </svg>
-                        <div>
-                          <strong>{countdown}</strong>
-                          <span>초</span>
-                        </div>
-                      </div>
-                      <div className="fall-copy">
-                        <span className="alert-kicker">
-                          <TriangleAlert size={16} aria-hidden="true" />
-                          쓰러짐 의심
-                        </span>
-                        <h2>누운 자세를 확인하고 있습니다</h2>
-                        <p>
-                          자세가 계속되면 기기 안전 알림을 생성합니다.
-                          {manualScenario && " 현재는 기능 테스트입니다."}
-                        </p>
-                        <div className="fall-actions">
-                          <button
-                            onClick={() => resolveVerification("recovered")}
-                          >
-                            <Check size={16} aria-hidden="true" />
-                            다시 일어남
-                          </button>
-                          <button
-                            onClick={() => resolveVerification("false_positive")}
-                          >
-                            <X size={16} aria-hidden="true" />
-                            오탐 취소
-                          </button>
-                          <button
-                            className="urgent"
-                            onClick={() => void finishEmergency()}
-                          >
-                            <Zap size={16} aria-hidden="true" />
-                            즉시 알림
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {alertPhase === "alerted" && (
-                    <div className="emergency-panel" role="alert">
-                      <div className="emergency-icon">
-                        <OctagonAlert size={34} aria-hidden="true" />
-                      </div>
-                      <span>SAFETY EVENT</span>
-                      <h2>쓰러짐 의심 알림을 기록했습니다</h2>
-                      <p>
-                        10초간 자세가 지속되었습니다. 실제 현장에서는 관제
-                        담당자의 최종 확인이 필요합니다.
-                      </p>
-                      <button
-                        className="button button-light"
-                        onClick={acknowledgeEmergency}
-                      >
-                        <CheckCircle2 size={17} aria-hidden="true" />
-                        관제 확인 완료
-                      </button>
-                    </div>
                   )}
 
                   {alertPhase === "recovered" && (
@@ -1987,6 +2029,101 @@ export default function Home() {
         </section>
       </div>
 
+      {alertPhase === "verifying" && (
+        <div
+          ref={alertPopupRef}
+          className="fall-panel"
+          role="alertdialog"
+          tabIndex={-1}
+          aria-modal="false"
+          aria-labelledby="fall-verification-title"
+          aria-describedby="fall-verification-description"
+        >
+          <div
+            className="countdown-ring"
+            role="timer"
+            aria-live="off"
+            aria-label={`${countdown}초 남음`}
+          >
+            <svg viewBox="0 0 120 120" aria-hidden="true">
+              <circle cx="60" cy="60" r="52" />
+              <circle
+                className="progress"
+                cx="60"
+                cy="60"
+                r="52"
+                style={{
+                  strokeDashoffset: 327 - 327 * (countdown / 10),
+                }}
+              />
+            </svg>
+            <div>
+              <strong>{countdown}</strong>
+              <span>초</span>
+            </div>
+          </div>
+          <div className="fall-copy">
+            <span className="alert-kicker">
+              <TriangleAlert size={16} aria-hidden="true" />
+              쓰러짐 의심
+            </span>
+            <h2 id="fall-verification-title">
+              누운 자세를 확인하고 있습니다
+            </h2>
+            <p id="fall-verification-description">
+              자세가 계속되면 기기 안전 알림을 생성합니다.
+              {manualScenario && " 현재는 기능 테스트입니다."}
+            </p>
+            <div className="fall-actions">
+              <button onClick={() => resolveVerification("recovered")}>
+                <Check size={16} aria-hidden="true" />
+                다시 일어남
+              </button>
+              <button onClick={() => resolveVerification("false_positive")}>
+                <X size={16} aria-hidden="true" />
+                오탐 취소
+              </button>
+              <button
+                className="urgent"
+                onClick={() => void finishEmergency()}
+              >
+                <Zap size={16} aria-hidden="true" />
+                즉시 알림
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {alertPhase === "alerted" && (
+        <div
+          ref={alertPopupRef}
+          className="emergency-panel"
+          role="alertdialog"
+          tabIndex={-1}
+          aria-modal="false"
+          aria-labelledby="fall-alert-title"
+          aria-describedby="fall-alert-description"
+        >
+          <div className="emergency-icon">
+            <OctagonAlert size={34} aria-hidden="true" />
+          </div>
+          <span>SAFETY EVENT</span>
+          <h2 id="fall-alert-title">쓰러짐 의심 알림을 기록했습니다</h2>
+          <p id="fall-alert-description">
+            10초간 자세가 지속되었습니다. 실제 현장에서는 관제 담당자의 최종
+            확인이 필요합니다.
+          </p>
+          <button
+            className="button button-light"
+            onClick={acknowledgeEmergency}
+          >
+            <CheckCircle2 size={17} aria-hidden="true" />
+            관제 확인 완료
+          </button>
+        </div>
+      )}
+
       <nav className="mobile-nav" aria-label="모바일 주요 메뉴">
         <button
           className={view === "patrol" ? "active" : ""}
@@ -2012,12 +2149,14 @@ export default function Home() {
         </button>
       </nav>
 
-      {toast && (
+      {toast &&
+        alertPhase !== "verifying" &&
+        alertPhase !== "alerted" && (
         <div className="toast" role="status">
           <CheckCircle2 size={18} aria-hidden="true" />
           {toast}
         </div>
-      )}
+        )}
     </main>
   );
 }

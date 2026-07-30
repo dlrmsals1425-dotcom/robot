@@ -75,6 +75,7 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   assert.match(serviceWorker, /notificationclick/);
   assert.match(serviceWorker, /showNotification/);
   assert.match(serviceWorker, /event\.request\.mode === "navigate"/);
+  assert.match(serviceWorker, /safebot-shell-v3/);
   assert.match(page, /FaceDetector|blaze_face_full_range|얼굴/);
   assert.match(
     visionWorker,
@@ -88,4 +89,28 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   await assert.rejects(
     access(new URL("app/_sites-preview", templateRoot)),
   );
+});
+
+test("keeps safety alerts compact and person overlays red", async () => {
+  const [page, styles, fallDetection] = await Promise.all([
+    readFile(new URL("app/page.tsx", templateRoot), "utf8"),
+    readFile(new URL("app/globals.css", templateRoot), "utf8"),
+    readFile(new URL("app/fall-detection.ts", templateRoot), "utf8"),
+  ]);
+
+  const fallPanelRule = styles.match(/\.fall-panel\s*\{([^}]*)\}/)?.[1] ?? "";
+  const emergencyPanelRule =
+    styles.match(/\.emergency-panel\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.doesNotMatch(fallPanelRule, /inset:\s*0/);
+  assert.match(fallPanelRule, /width:\s*min\(440px/);
+  assert.doesNotMatch(emergencyPanelRule, /inset:\s*0/);
+  assert.match(emergencyPanelRule, /width:\s*min\(410px/);
+  assert.match(page, /const PERSON_DETECTION_COLOR = "#ff4d5a"/);
+  assert.match(page, /const OBJECT_DETECTION_COLOR = "#7bd4ff"/);
+  assert.match(page, /for \(const pose of result\.poses\)/);
+  assert.match(page, /role="alertdialog"/);
+  assert.match(fallDetection, /angleFromHorizontal < 30/);
+  assert.match(fallDetection, /completeLeg/);
+  assert.match(fallDetection, /FALL_NEGATIVE_BUDGET_MS/);
 });
