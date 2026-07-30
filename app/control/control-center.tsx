@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { useLiveViewer } from "./use-live-viewer";
 
 type AuthState = "checking" | "signed_out" | "signed_in" | "unavailable";
 
@@ -146,6 +147,13 @@ export default function ControlCenter() {
   const [loadingEvents, setLoadingEvents] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<ControlEvent | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const {
+    videoRef: liveVideoRef,
+    state: liveViewerState,
+    hasStream: hasLiveStream,
+    isLive,
+    reconnect: reconnectLiveViewer,
+  } = useLiveViewer(authState === "signed_in");
 
   const loadEvents = useCallback(async () => {
     setLoadingEvents(true);
@@ -277,6 +285,12 @@ export default function ControlCenter() {
     ).length;
   }, [events]);
   const latestEvent = events[0] ?? null;
+  const liveStatusLabel =
+    liveViewerState === "live"
+      ? "LIVE"
+      : liveViewerState === "connecting"
+        ? "실시간 연결 중"
+        : "현장기기 오프라인";
 
   return (
     <main className="control-root">
@@ -412,7 +426,7 @@ export default function ControlCenter() {
               </span>
               <h1>주민안전 관제 현황</h1>
               <p>
-                쓰러짐 확정 이벤트와 익명화된 10초 영상을 확인하고 현장 대응을
+                현장의 실시간 영상과 쓰러짐 확정 이벤트를 함께 확인하고 대응을
                 판단합니다.
               </p>
             </div>
@@ -455,7 +469,7 @@ export default function ControlCenter() {
               </span>
               <div>
                 <small>등록 현장기기</small>
-                <strong>{events.length ? 1 : 0}<i>대</i></strong>
+                <strong>{isLive || events.length ? 1 : 0}<i>대</i></strong>
               </div>
             </article>
             <article>
@@ -473,16 +487,61 @@ export default function ControlCenter() {
             <article className="control-preview-card">
               <div className="control-card-heading">
                 <div>
-                  <span className="eyebrow">LATEST EVENT</span>
-                  <h2>최근 현장 영상</h2>
+                  <span className="eyebrow">LIVE CONTROL</span>
+                  <h2>현장 실시간 관제</h2>
                 </div>
-                {latestEvent && (
-                  <span className={`control-status status-${latestEvent.status}`}>
-                    {statusLabel(latestEvent.status)}
+                {isLive ? (
+                  <span
+                    className="device-online"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <span />
+                    {liveStatusLabel}
+                  </span>
+                ) : (
+                  <span
+                    className="control-status"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {liveStatusLabel}
                   </span>
                 )}
               </div>
-              {latestEvent ? (
+              {hasLiveStream ? (
+                <div
+                  className="control-preview"
+                  style={{ cursor: "default" }}
+                >
+                  <video
+                    ref={liveVideoRef}
+                    controls
+                    autoPlay
+                    muted
+                    playsInline
+                    aria-label="현장기기 실시간 영상"
+                    style={{
+                      display: "block",
+                      width: "100%",
+                      height: "100%",
+                      objectFit: "cover",
+                    }}
+                  />
+                  <span
+                    className="control-play"
+                    aria-hidden="true"
+                    style={{
+                      top: 15,
+                      bottom: "auto",
+                      pointerEvents: "none",
+                    }}
+                  >
+                    <Radio size={17} aria-hidden="true" />
+                    {liveStatusLabel}
+                  </span>
+                </div>
+              ) : latestEvent ? (
                 <button
                   className="control-preview"
                   onClick={() =>
@@ -526,11 +585,30 @@ export default function ControlCenter() {
               <div className="control-stream-note">
                 <Radio size={17} aria-hidden="true" />
                 <div>
-                  <strong>이벤트 영상 관제 단계</strong>
+                  <strong>
+                    {isLive
+                      ? "현장 실시간 영상 수신 중"
+                      : liveViewerState === "connecting"
+                        ? "실시간 영상 연결 중"
+                        : "현장기기 오프라인"}
+                  </strong>
                   <p>
-                    현재는 확정된 10초 영상을 수신합니다. 로봇의 실시간 원격
-                    영상은 향후 WebRTC 송신 모듈 연결 후 제공됩니다.
+                    {isLive
+                      ? "WebRTC로 현장 영상을 실시간 수신합니다. 확정된 10초 사건 영상은 아래 이력에도 계속 보관됩니다."
+                      : "실시간 영상이 없을 때는 가장 최근에 저장된 10초 사건 영상을 표시합니다."}
                   </p>
+                  {!isLive && (
+                    <button
+                      className="button button-ghost"
+                      type="button"
+                      onClick={reconnectLiveViewer}
+                      aria-label="현장 실시간 영상 다시 연결"
+                      style={{ justifySelf: "start", marginTop: 6 }}
+                    >
+                      <RefreshCw size={15} aria-hidden="true" />
+                      다시 연결
+                    </button>
+                  )}
                 </div>
               </div>
             </article>
@@ -541,10 +619,14 @@ export default function ControlCenter() {
                   <span className="eyebrow">FIELD DEVICE</span>
                   <h2>현장기기 상태</h2>
                 </div>
-                <span className="device-online">
-                  <span />
-                  {events.length ? "최근 이벤트 수신" : "연결 대기"}
-                </span>
+                {isLive ? (
+                  <span className="device-online">
+                    <span />
+                    실시간 연결됨
+                  </span>
+                ) : (
+                  <span className="control-status">{liveStatusLabel}</span>
+                )}
               </div>
               <div className="device-identity">
                 <span>
@@ -559,7 +641,9 @@ export default function ControlCenter() {
                 <div>
                   <dt>최근 수신</dt>
                   <dd>
-                    {latestEvent
+                    {isLive
+                      ? "실시간 수신 중"
+                      : latestEvent
                       ? formatDateTime(latestEvent.createdAt)
                       : "수신 대기"}
                   </dd>

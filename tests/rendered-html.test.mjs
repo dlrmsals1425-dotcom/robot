@@ -165,3 +165,46 @@ test("ships anonymized clip recording, bounded local storage, and private event 
   assert.match(wrangler, /"migrations_dir": "migrations"/);
   assert.match(packageJson, /"migrate:cloudflare"/);
 });
+
+test("ships authenticated P2P live control without raw video, audio, TURN, or R2", async () => {
+  const [page, sender, viewer, worker, control, wrangler] =
+    await Promise.all([
+      readFile(new URL("app/page.tsx", templateRoot), "utf8"),
+      readFile(new URL("app/live-stream.ts", templateRoot), "utf8"),
+      readFile(
+        new URL("app/control/use-live-viewer.ts", templateRoot),
+        "utf8",
+      ),
+      readFile(new URL("worker/index.ts", templateRoot), "utf8"),
+      readFile(
+        new URL("app/control/control-center.tsx", templateRoot),
+        "utf8",
+      ),
+      readFile(new URL("wrangler.jsonc", templateRoot), "utf8"),
+    ]);
+
+  assert.match(page, /new LiveBroadcastSender\(\{\s*canvas,/);
+  assert.match(page, /const canvas = recordingCanvasRef\.current/);
+  assert.match(page, /관제 실시간 공유/);
+  assert.match(sender, /this\.canvas\.captureStream\(FRAME_RATE\)/);
+  assert.match(sender, /getAudioTracks\(\).*track\.stop\(\)/);
+  assert.doesNotMatch(sender, /streamRef|navigator\.mediaDevices|getUserMedia/);
+  assert.match(sender, /stun:stun\.cloudflare\.com:3478/);
+  assert.doesNotMatch(sender, /\bturns?:/i);
+  assert.match(sender, /MAX_VIDEO_BITRATE = 600_000/);
+  assert.match(sender, /MAX_RECONNECT_ATTEMPTS = 6/);
+
+  assert.match(viewer, /stun:stun\.cloudflare\.com:3478/);
+  assert.doesNotMatch(viewer, /\bturns?:/i);
+  assert.match(viewer, /MAX_RECONNECT_ATTEMPTS = 8/);
+  assert.match(control, /현장 실시간 관제/);
+
+  assert.match(worker, /assertLiveSocketOrigin\(request\)/);
+  assert.match(worker, /await requireSession\(request, env\)/);
+  assert.match(worker, /MAX_LIVE_VIEWERS = 3/);
+  assert.match(worker, /acceptWebSocket\(server\)/);
+  assert.doesNotMatch(worker, /R2Bucket|EVENT_MEDIA/);
+  assert.match(wrangler, /"name": "LIVE_ROOM"/);
+  assert.match(wrangler, /"new_sqlite_classes": \["LiveRoom"\]/);
+  assert.doesNotMatch(wrangler, /r2_buckets/i);
+});

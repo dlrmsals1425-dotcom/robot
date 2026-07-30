@@ -9,6 +9,7 @@ import handler from "vinext/server/app-router-entry";
 interface Env {
   ASSETS: Fetcher;
   DB?: D1Database;
+  LIVE_ROOM?: DurableObjectNamespace;
   CONTROL_PASSWORD?: string;
   SESSION_SECRET?: string;
   IMAGES?: {
@@ -97,6 +98,22 @@ type SessionClaims = {
   exp: number;
 };
 
+type LiveRole = "pending" | "broadcaster" | "viewer";
+
+type LiveSocketAttachment = {
+  peerId: string;
+  role: LiveRole;
+  joinedAt: number;
+  sessionExpiresAt: number;
+  rateWindowStartedAt: number;
+  rateWindowMessages: number;
+};
+
+type LiveRoomSnapshot = {
+  broadcaster: { socket: WebSocket; state: LiveSocketAttachment } | null;
+  viewers: Array<{ socket: WebSocket; state: LiveSocketAttachment }>;
+};
+
 const SESSION_COOKIE = "__Host-safebot_session";
 const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -112,6 +129,16 @@ const MAX_JSON_BODY_BYTES = 2 * 1024;
 const MAX_META_BYTES = 8 * 1024;
 const MAX_CLIP_BYTES = 12 * 1024 * 1024;
 const MAX_POSTER_BYTES = 1024 * 1024;
+const LIVE_ROOM_NAME = "safebot-main-room";
+const LIVE_SESSION_EXPIRY_HEADER = "X-Safebot-Session-Expires-At";
+const MAX_LIVE_VIEWERS = 3;
+const MAX_LIVE_CONNECTIONS = MAX_LIVE_VIEWERS + 1;
+const MAX_SIGNAL_MESSAGE_BYTES = 64 * 1024;
+const MAX_SDP_BYTES = 48 * 1024;
+const MAX_ICE_CANDIDATE_BYTES = 4 * 1024;
+const MAX_SIGNAL_MESSAGES_PER_MINUTE = 240;
+const LIVE_JOIN_TIMEOUT_MS = 15_000;
+const LIVE_PEER_ID_PATTERN = /^live-[0-9a-f-]{36}$/u;
 const MAX_MULTIPART_BYTES =
   MAX_META_BYTES + MAX_CLIP_BYTES + MAX_POSTER_BYTES + 64 * 1024;
 const ALLOWED_CLIP_TYPES = new Set(["video/mp4", "video/webm"]);
@@ -147,6 +174,20 @@ function apiHeaders(extra?: HeadersInit) {
   headers.set("Referrer-Policy", "no-referrer");
   headers.set("X-Content-Type-Options", "nosniff");
   return headers;
+}
+
+function securePageResponse(response: Response) {
+  const headers = new Headers(response.headers);
+  headers.set("Content-Security-Policy", "frame-ancestors 'none'");
+  headers.set("Permissions-Policy", "camera=(self), microphone=(), geolocation=()");
+  headers.set("Referrer-Policy", "no-referrer");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Frame-Options", "DENY");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function jsonResponse(
@@ -1605,6 +1646,47 @@ async function handleEventResource(
   return methodNotAllowed(["DELETE"]);
 }
 
+function assertLiveSocketOrigin(request: Request) {
+  const origin = request.headers.get("Origin");
+  if (!origin || origin !== new URL(request.url).origin) {
+    throw new ApiError(
+      403,
+      "CROSS_ORIGIN_REQUEST",
+      "동일한 SAFEBOT 사이트에서만 실시간 연결할 수 있습니다.",
+    );
+  }
+  assertSameOrigin(request);
+}
+
+async function handleLiveSocket(request: Request, env: Env) {
+  if (request.method !== "GET") return methodNotAllowed(["GET"]);
+  assertLiveSocketOrigin(request);
+  const claims = await requireSession(request, env);
+
+  if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+    throw new ApiError(
+      426,
+      "WEBSOCKET_UPGRADE_REQUIRED",
+      "WebSocket 연결 요청이 필요합니다.",
+    );
+  }
+  if (!env.LIVE_ROOM) {
+    throw new ApiError(
+      503,
+      "LIVE_ROOM_NOT_CONFIGURED",
+      "실시간 관제 연결이 아직 준비되지 않았습니다.",
+    );
+  }
+
+  const roomId = env.LIVE_ROOM.idFromName(LIVE_ROOM_NAME);
+  const headers = new Headers(request.headers);
+  headers.set(LIVE_SESSION_EXPIRY_HEADER, String(claims.exp * 1000));
+  headers.delete("Cookie");
+  return env.LIVE_ROOM
+    .get(roomId)
+    .fetch(new Request(request, { headers }));
+}
+
 async function handleApi(
   request: Request,
   env: Env,
@@ -1620,6 +1702,9 @@ async function handleApi(
     }
     if (url.pathname === "/api/auth/logout") {
       return await handleLogout(request);
+    }
+    if (url.pathname === "/api/live/socket") {
+      return await handleLiveSocket(request, env);
     }
     if (url.pathname === "/api/events") {
       ctx.waitUntil(cleanupExpiredEvents(env).catch(() => undefined));
@@ -1652,6 +1737,741 @@ async function handleApi(
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  required: string[],
+  optional: string[] = [],
+) {
+  const allowed = new Set([...required, ...optional]);
+  const keys = Object.keys(value);
+  return (
+    required.every((key) => Object.hasOwn(value, key)) &&
+    keys.every((key) => allowed.has(key))
+  );
+}
+
+function readLiveAttachment(socket: WebSocket) {
+  let value: unknown;
+  try {
+    value = socket.deserializeAttachment();
+  } catch {
+    return null;
+  }
+  if (
+    !isRecord(value) ||
+    typeof value.peerId !== "string" ||
+    !LIVE_PEER_ID_PATTERN.test(value.peerId) ||
+    (value.role !== "pending" &&
+      value.role !== "broadcaster" &&
+      value.role !== "viewer") ||
+    typeof value.joinedAt !== "number" ||
+    !Number.isFinite(value.joinedAt) ||
+    typeof value.sessionExpiresAt !== "number" ||
+    !Number.isInteger(value.sessionExpiresAt) ||
+    value.sessionExpiresAt <= 0 ||
+    typeof value.rateWindowStartedAt !== "number" ||
+    !Number.isFinite(value.rateWindowStartedAt) ||
+    typeof value.rateWindowMessages !== "number" ||
+    !Number.isInteger(value.rateWindowMessages)
+  ) {
+    return null;
+  }
+  return value as LiveSocketAttachment;
+}
+
+function sendLiveMessage(socket: WebSocket, value: unknown) {
+  if (socket.readyState !== 1) return;
+  try {
+    socket.send(JSON.stringify(value));
+  } catch {
+    // A peer can disconnect between readyState inspection and send().
+  }
+}
+
+function closeLiveSocket(
+  socket: WebSocket,
+  code: number,
+  errorCode: string,
+  message: string,
+) {
+  sendLiveMessage(socket, {
+    type: "status",
+    status: "error",
+    code: errorCode,
+    message,
+  });
+  try {
+    socket.close(code, errorCode.slice(0, 120));
+  } catch {
+    // The connection may already be closing.
+  }
+}
+
+function sendLiveError(
+  socket: WebSocket,
+  code: string,
+  message: string,
+  peerId?: string,
+) {
+  sendLiveMessage(socket, {
+    type: "error",
+    code,
+    message,
+    ...(peerId ? { peerId } : {}),
+  });
+}
+
+function liveRoomSnapshot(state: DurableObjectState): LiveRoomSnapshot {
+  let broadcaster: LiveRoomSnapshot["broadcaster"] = null;
+  const viewers: LiveRoomSnapshot["viewers"] = [];
+  for (const socket of state.getWebSockets()) {
+    if (socket.readyState !== 1) continue;
+    const attachment = readLiveAttachment(socket);
+    if (!attachment) continue;
+    if (attachment.role === "broadcaster" && !broadcaster) {
+      broadcaster = { socket, state: attachment };
+    } else if (attachment.role === "viewer") {
+      viewers.push({ socket, state: attachment });
+    }
+  }
+  return { broadcaster, viewers };
+}
+
+function liveRoomStatus(snapshot: LiveRoomSnapshot) {
+  return {
+    type: "status",
+    status: "room-state",
+    broadcasterOnline: snapshot.broadcaster !== null,
+    viewerCount: snapshot.viewers.length,
+    maxViewers: MAX_LIVE_VIEWERS,
+  };
+}
+
+function broadcastLiveRoomStatus(state: DurableObjectState) {
+  const snapshot = liveRoomSnapshot(state);
+  const message = liveRoomStatus(snapshot);
+  if (snapshot.broadcaster) {
+    sendLiveMessage(snapshot.broadcaster.socket, message);
+  }
+  for (const viewer of snapshot.viewers) {
+    sendLiveMessage(viewer.socket, message);
+  }
+}
+
+function requireSignalText(
+  value: unknown,
+  field: string,
+  maximumBytes: number,
+  allowEmpty = false,
+) {
+  if (
+    typeof value !== "string" ||
+    (!allowEmpty && value.length === 0) ||
+    utf8Length(value) > maximumBytes
+  ) {
+    throw new Error(`invalid ${field}`);
+  }
+  return value;
+}
+
+function requireSignalTarget(value: unknown) {
+  if (typeof value !== "string" || !LIVE_PEER_ID_PATTERN.test(value)) {
+    throw new Error("invalid target");
+  }
+  return value;
+}
+
+function parseSessionDescription(
+  value: unknown,
+  expectedType: "offer" | "answer",
+) {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["type", "sdp"]) ||
+    value.type !== expectedType
+  ) {
+    throw new Error("invalid session description");
+  }
+  return {
+    type: expectedType,
+    sdp: requireSignalText(value.sdp, "sdp", MAX_SDP_BYTES),
+  };
+}
+
+function parseIceCandidate(value: unknown) {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["candidate"], [
+      "sdpMid",
+      "sdpMLineIndex",
+      "usernameFragment",
+    ])
+  ) {
+    throw new Error("invalid ICE candidate");
+  }
+  const candidate = requireSignalText(
+    value.candidate,
+    "candidate",
+    MAX_ICE_CANDIDATE_BYTES,
+    true,
+  );
+  const sdpMid =
+    value.sdpMid === undefined || value.sdpMid === null
+      ? null
+      : requireSignalText(value.sdpMid, "sdpMid", 128, true);
+  const sdpMLineIndex =
+    value.sdpMLineIndex === undefined || value.sdpMLineIndex === null
+      ? null
+      : value.sdpMLineIndex;
+  if (
+    sdpMLineIndex !== null &&
+    (!Number.isInteger(sdpMLineIndex) ||
+      (sdpMLineIndex as number) < 0 ||
+      (sdpMLineIndex as number) > 65_535)
+  ) {
+    throw new Error("invalid sdpMLineIndex");
+  }
+  const usernameFragment =
+    value.usernameFragment === undefined || value.usernameFragment === null
+      ? null
+      : requireSignalText(
+          value.usernameFragment,
+          "usernameFragment",
+          256,
+          true,
+        );
+  return {
+    candidate,
+    sdpMid,
+    sdpMLineIndex: sdpMLineIndex as number | null,
+    usernameFragment,
+  };
+}
+
+function parseLiveSignal(message: string) {
+  if (utf8Length(message) > MAX_SIGNAL_MESSAGE_BYTES) {
+    throw new ApiError(
+      1009,
+      "SIGNAL_TOO_LARGE",
+      "실시간 연결 메시지가 너무 큽니다.",
+    );
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(message);
+  } catch {
+    throw new ApiError(
+      1008,
+      "INVALID_SIGNAL_JSON",
+      "실시간 연결 메시지 형식이 올바르지 않습니다.",
+    );
+  }
+  if (!isRecord(value) || typeof value.type !== "string") {
+    throw new ApiError(
+      1008,
+      "INVALID_SIGNAL",
+      "실시간 연결 메시지가 올바르지 않습니다.",
+    );
+  }
+
+  try {
+    if (value.type === "join") {
+      if (
+        !hasExactKeys(value, ["type", "role"]) ||
+        (value.role !== "broadcaster" && value.role !== "viewer")
+      ) {
+        throw new Error("invalid join");
+      }
+      return {
+        type: "join" as const,
+        role: value.role as "broadcaster" | "viewer",
+      };
+    }
+    if (value.type === "offer" || value.type === "answer") {
+      if (!hasExactKeys(value, ["type", "target", "sdp"])) {
+        throw new Error("invalid description relay");
+      }
+      return {
+        type: value.type,
+        target: requireSignalTarget(value.target),
+        sdp: parseSessionDescription(value.sdp, value.type),
+      } as const;
+    }
+    if (value.type === "ice") {
+      if (!hasExactKeys(value, ["type", "target", "candidate"])) {
+        throw new Error("invalid ICE relay");
+      }
+      return {
+        type: "ice" as const,
+        target: requireSignalTarget(value.target),
+        candidate: parseIceCandidate(value.candidate),
+      };
+    }
+    if (value.type === "status") {
+      if (
+        !hasExactKeys(value, ["type", "state"]) ||
+        (value.state !== "ready" &&
+          value.state !== "live" &&
+          value.state !== "paused" &&
+          value.state !== "ended")
+      ) {
+        throw new Error("invalid status");
+      }
+      return { type: "status" as const, state: value.state };
+    }
+  } catch {
+    throw new ApiError(
+      1008,
+      "INVALID_SIGNAL",
+      "실시간 연결 메시지가 올바르지 않습니다.",
+    );
+  }
+
+  throw new ApiError(
+    1008,
+    "UNKNOWN_SIGNAL_TYPE",
+    "지원하지 않는 실시간 연결 메시지입니다.",
+  );
+}
+
+function findLivePeer(
+  snapshot: LiveRoomSnapshot,
+  peerId: string,
+  role: Exclude<LiveRole, "pending">,
+) {
+  if (
+    role === "broadcaster" &&
+    snapshot.broadcaster?.state.peerId === peerId
+  ) {
+    return snapshot.broadcaster;
+  }
+  if (role === "viewer") {
+    return (
+      snapshot.viewers.find((viewer) => viewer.state.peerId === peerId) ?? null
+    );
+  }
+  return null;
+}
+
+/**
+ * A single hibernatable signaling room. It relays WebRTC negotiation metadata
+ * only; SDP and ICE candidates are never written to Durable Object storage.
+ */
+export class LiveRoom {
+  constructor(private readonly state: DurableObjectState) {}
+
+  async fetch(request: Request): Promise<Response> {
+    if (
+      request.method !== "GET" ||
+      request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
+    ) {
+      return jsonResponse(
+        {
+          error: {
+            code: "WEBSOCKET_UPGRADE_REQUIRED",
+            message: "WebSocket 연결 요청이 필요합니다.",
+          },
+        },
+        426,
+      );
+    }
+
+    const now = Date.now();
+    const sessionExpiresAt = Number(
+      request.headers.get(LIVE_SESSION_EXPIRY_HEADER),
+    );
+    if (
+      !Number.isInteger(sessionExpiresAt) ||
+      sessionExpiresAt <= now
+    ) {
+      return jsonResponse(
+        {
+          error: {
+            code: "SESSION_EXPIRED",
+            message: "관제 인증이 만료되었습니다.",
+          },
+        },
+        401,
+      );
+    }
+    for (const socket of this.state.getWebSockets()) {
+      if (socket.readyState !== 1) continue;
+      const attachment = readLiveAttachment(socket);
+      if (
+        attachment?.role === "pending" &&
+        now - attachment.joinedAt > LIVE_JOIN_TIMEOUT_MS
+      ) {
+        closeLiveSocket(
+          socket,
+          1008,
+          "JOIN_TIMEOUT",
+          "실시간 관제실 참여 시간이 초과되었습니다.",
+        );
+      }
+    }
+    const openConnections = this.state
+      .getWebSockets()
+      .filter((socket) => socket.readyState === 1).length;
+    if (openConnections >= MAX_LIVE_CONNECTIONS) {
+      return jsonResponse(
+        {
+          error: {
+            code: "LIVE_ROOM_CONNECTION_LIMIT",
+            message: "실시간 관제 연결 인원이 가득 찼습니다.",
+          },
+        },
+        429,
+        { "Retry-After": "5" },
+      );
+    }
+
+    const [client, server] = Object.values(new WebSocketPair());
+    const attachment: LiveSocketAttachment = {
+      peerId: `live-${crypto.randomUUID()}`,
+      role: "pending",
+      joinedAt: now,
+      sessionExpiresAt,
+      rateWindowStartedAt: now,
+      rateWindowMessages: 0,
+    };
+    server.serializeAttachment(attachment);
+    this.state.acceptWebSocket(server);
+    await this.scheduleNextSessionAlarm();
+
+    const snapshot = liveRoomSnapshot(this.state);
+    sendLiveMessage(server, {
+      type: "status",
+      status: "connected",
+      peerId: attachment.peerId,
+      broadcasterOnline: snapshot.broadcaster !== null,
+      viewerCount: snapshot.viewers.length,
+      maxViewers: MAX_LIVE_VIEWERS,
+    });
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer) {
+    const attachment = readLiveAttachment(socket);
+    if (!attachment) {
+      closeLiveSocket(
+        socket,
+        1008,
+        "INVALID_CONNECTION_STATE",
+        "실시간 연결 상태가 올바르지 않습니다.",
+      );
+      return;
+    }
+    if (attachment.sessionExpiresAt <= Date.now()) {
+      closeLiveSocket(
+        socket,
+        4401,
+        "SESSION_EXPIRED",
+        "관제 인증이 만료되었습니다.",
+      );
+      await this.scheduleNextSessionAlarm(socket);
+      return;
+    }
+    if (typeof message !== "string") {
+      closeLiveSocket(
+        socket,
+        1003,
+        "BINARY_SIGNAL_NOT_ALLOWED",
+        "문자 형식의 실시간 연결 메시지만 허용됩니다.",
+      );
+      return;
+    }
+
+    const now = Date.now();
+    if (now - attachment.rateWindowStartedAt >= 60_000) {
+      attachment.rateWindowStartedAt = now;
+      attachment.rateWindowMessages = 0;
+    }
+    attachment.rateWindowMessages += 1;
+    socket.serializeAttachment(attachment);
+    if (attachment.rateWindowMessages > MAX_SIGNAL_MESSAGES_PER_MINUTE) {
+      closeLiveSocket(
+        socket,
+        1008,
+        "SIGNAL_RATE_LIMIT",
+        "실시간 연결 메시지가 너무 많습니다.",
+      );
+      return;
+    }
+
+    let signal: ReturnType<typeof parseLiveSignal>;
+    try {
+      signal = parseLiveSignal(message);
+    } catch (error) {
+      if (error instanceof ApiError) {
+        closeLiveSocket(
+          socket,
+          error.status,
+          error.code,
+          error.message,
+        );
+      } else {
+        closeLiveSocket(
+          socket,
+          1008,
+          "INVALID_SIGNAL",
+          "실시간 연결 메시지가 올바르지 않습니다.",
+        );
+      }
+      return;
+    }
+
+    if (signal.type === "join") {
+      if (attachment.role !== "pending") {
+        closeLiveSocket(
+          socket,
+          1008,
+          "ALREADY_JOINED",
+          "이미 실시간 관제실에 참여했습니다.",
+        );
+        return;
+      }
+      const beforeJoin = liveRoomSnapshot(this.state);
+      if (signal.role === "broadcaster" && beforeJoin.broadcaster) {
+        closeLiveSocket(
+          socket,
+          1008,
+          "BROADCASTER_ALREADY_CONNECTED",
+          "이미 현장 영상이 송출 중입니다.",
+        );
+        return;
+      }
+      if (
+        signal.role === "viewer" &&
+        beforeJoin.viewers.length >= MAX_LIVE_VIEWERS
+      ) {
+        closeLiveSocket(
+          socket,
+          1008,
+          "VIEWER_LIMIT_REACHED",
+          "동시에 접속할 수 있는 관제 화면은 최대 3대입니다.",
+        );
+        return;
+      }
+
+      attachment.role = signal.role;
+      socket.serializeAttachment(attachment);
+      const afterJoin = liveRoomSnapshot(this.state);
+      sendLiveMessage(socket, {
+        type: "status",
+        status: "joined",
+        peerId: attachment.peerId,
+        role: attachment.role,
+        broadcasterOnline: afterJoin.broadcaster !== null,
+        viewerCount: afterJoin.viewers.length,
+        maxViewers: MAX_LIVE_VIEWERS,
+      });
+      broadcastLiveRoomStatus(this.state);
+
+      if (attachment.role === "viewer" && afterJoin.broadcaster) {
+        sendLiveMessage(afterJoin.broadcaster.socket, {
+          type: "viewer-joined",
+          viewerId: attachment.peerId,
+        });
+      } else if (attachment.role === "broadcaster") {
+        for (const viewer of afterJoin.viewers) {
+          sendLiveMessage(socket, {
+            type: "viewer-joined",
+            viewerId: viewer.state.peerId,
+          });
+        }
+      }
+      return;
+    }
+
+    if (attachment.role === "pending") {
+      closeLiveSocket(
+        socket,
+        1008,
+        "JOIN_REQUIRED",
+        "먼저 실시간 관제실 참여 메시지를 보내야 합니다.",
+      );
+      return;
+    }
+
+    const snapshot = liveRoomSnapshot(this.state);
+    if (signal.type === "offer") {
+      if (attachment.role !== "broadcaster") {
+        closeLiveSocket(
+          socket,
+          1008,
+          "ROLE_NOT_ALLOWED",
+          "현장 송출자만 영상 연결 제안을 보낼 수 있습니다.",
+        );
+        return;
+      }
+      const target = findLivePeer(snapshot, signal.target, "viewer");
+      if (!target) {
+        sendLiveError(
+          socket,
+          "TARGET_NOT_FOUND",
+          "연결할 관제 화면을 찾을 수 없습니다.",
+          signal.target,
+        );
+        return;
+      }
+      sendLiveMessage(target.socket, {
+        type: "offer",
+        from: attachment.peerId,
+        sdp: signal.sdp,
+      });
+      return;
+    }
+    if (signal.type === "answer") {
+      if (attachment.role !== "viewer") {
+        closeLiveSocket(
+          socket,
+          1008,
+          "ROLE_NOT_ALLOWED",
+          "관제 화면만 영상 연결 응답을 보낼 수 있습니다.",
+        );
+        return;
+      }
+      const target = findLivePeer(snapshot, signal.target, "broadcaster");
+      if (!target) {
+        sendLiveError(
+          socket,
+          "TARGET_NOT_FOUND",
+          "현장 송출 연결을 찾을 수 없습니다.",
+          signal.target,
+        );
+        return;
+      }
+      sendLiveMessage(target.socket, {
+        type: "answer",
+        from: attachment.peerId,
+        sdp: signal.sdp,
+      });
+      return;
+    }
+    if (signal.type === "ice") {
+      const targetRole =
+        attachment.role === "broadcaster" ? "viewer" : "broadcaster";
+      const target = findLivePeer(snapshot, signal.target, targetRole);
+      if (!target) {
+        sendLiveError(
+          socket,
+          "TARGET_NOT_FOUND",
+          "실시간 영상 연결 상대를 찾을 수 없습니다.",
+          signal.target,
+        );
+        return;
+      }
+      sendLiveMessage(target.socket, {
+        type: "ice",
+        from: attachment.peerId,
+        candidate: signal.candidate,
+      });
+      return;
+    }
+
+    for (const peer of [
+      ...(snapshot.broadcaster ? [snapshot.broadcaster] : []),
+      ...snapshot.viewers,
+    ]) {
+      if (peer.state.peerId !== attachment.peerId) {
+        sendLiveMessage(peer.socket, {
+          type: "status",
+          status: "peer-state",
+          peerId: attachment.peerId,
+          role: attachment.role,
+          state: signal.state,
+        });
+      }
+    }
+  }
+
+  async webSocketClose(
+    socket: WebSocket,
+    code: number,
+    reason: string,
+  ) {
+    this.notifyPeerLeft(socket);
+    if (socket.readyState !== 3) {
+      try {
+        socket.close(code, reason.slice(0, 120));
+      } catch {
+        // The runtime may already have completed the close handshake.
+      }
+    }
+    await this.scheduleNextSessionAlarm(socket);
+  }
+
+  async webSocketError(socket: WebSocket) {
+    this.notifyPeerLeft(socket);
+    if (socket.readyState !== 3) {
+      try {
+        socket.close(1011, "LIVE_SOCKET_ERROR");
+      } catch {
+        // The connection is already unavailable.
+      }
+    }
+    await this.scheduleNextSessionAlarm(socket);
+  }
+
+  async alarm() {
+    const now = Date.now();
+    for (const socket of this.state.getWebSockets()) {
+      if (socket.readyState !== 1) continue;
+      const attachment = readLiveAttachment(socket);
+      if (attachment && attachment.sessionExpiresAt <= now) {
+        closeLiveSocket(
+          socket,
+          4401,
+          "SESSION_EXPIRED",
+          "관제 인증이 만료되었습니다.",
+        );
+      }
+    }
+    await this.scheduleNextSessionAlarm();
+  }
+
+  private notifyPeerLeft(socket: WebSocket) {
+    const attachment = readLiveAttachment(socket);
+    if (!attachment || attachment.role === "pending") return;
+    const snapshot = liveRoomSnapshot(this.state);
+    const peers = [
+      ...(snapshot.broadcaster ? [snapshot.broadcaster] : []),
+      ...snapshot.viewers,
+    ];
+    for (const peer of peers) {
+      if (peer.state.peerId !== attachment.peerId) {
+        sendLiveMessage(peer.socket, {
+          type: "peer-left",
+          peerId: attachment.peerId,
+          role: attachment.role,
+        });
+      }
+    }
+    broadcastLiveRoomStatus(this.state);
+  }
+
+  private async scheduleNextSessionAlarm(excludedSocket?: WebSocket) {
+    let nextExpiry = Number.POSITIVE_INFINITY;
+    for (const socket of this.state.getWebSockets()) {
+      if (socket === excludedSocket || socket.readyState !== 1) continue;
+      const attachment = readLiveAttachment(socket);
+      if (attachment) {
+        nextExpiry = Math.min(nextExpiry, attachment.sessionExpiresAt);
+      }
+    }
+    if (Number.isFinite(nextExpiry)) {
+      await this.state.storage.setAlarm(nextExpiry);
+    } else {
+      await this.state.storage.deleteAlarm();
+    }
+  }
+}
+
 const worker = {
   async fetch(
     request: Request,
@@ -1666,23 +2486,25 @@ const worker = {
 
     if (url.pathname === "/_vinext/image" && env.IMAGES && env.ASSETS) {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
-      return handleImageOptimization(
-        request,
-        {
-          fetchAsset: (path) =>
-            env.ASSETS.fetch(new Request(new URL(path, request.url))),
-          transformImage: async (body, { width, format, quality }) => {
-            const result = await env.IMAGES!.input(body)
-              .transform(width > 0 ? { width } : {})
-              .output({ format, quality });
-            return result.response();
+      return securePageResponse(
+        await handleImageOptimization(
+          request,
+          {
+            fetchAsset: (path) =>
+              env.ASSETS.fetch(new Request(new URL(path, request.url))),
+            transformImage: async (body, { width, format, quality }) => {
+              const result = await env.IMAGES!.input(body)
+                .transform(width > 0 ? { width } : {})
+                .output({ format, quality });
+              return result.response();
+            },
           },
-        },
-        allowedWidths,
+          allowedWidths,
+        ),
       );
     }
 
-    return handler.fetch(request, env, ctx);
+    return securePageResponse(await handler.fetch(request, env, ctx));
   },
 
   async scheduled(

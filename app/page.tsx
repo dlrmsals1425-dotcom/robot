@@ -71,6 +71,16 @@ import {
   type VerificationProgress,
   updateVerificationProgress,
 } from "./fall-detection";
+import {
+  IDLE_LIVE_BROADCAST,
+  LiveBroadcastSender,
+  type LiveBroadcastSnapshot,
+} from "./live-stream";
+import {
+  decidePrivacyFrame,
+  resolvePrivacyFrameMode,
+  type PrivacyFrameDecision,
+} from "./privacy-frame";
 
 type AppView = "patrol" | "history" | "guide";
 type CameraState = "idle" | "starting" | "running" | "error";
@@ -152,6 +162,13 @@ type VisionStats = {
   latencyMs: number;
 };
 
+type PendingInferenceFrame = {
+  timestamp: number;
+  frameWidth: number;
+  frameHeight: number;
+  cameraGeneration: number;
+};
+
 const FALL_CONFIRMATION_MS = 10_000;
 const SUSPECT_STABILITY_MS = 1_800;
 const MIN_SUSPECT_SAMPLES = 6;
@@ -215,6 +232,104 @@ function formatDate(iso: string) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function isUsableDetectionBox(
+  box: DetectionBox | undefined,
+  frameWidth: number,
+  frameHeight: number,
+) {
+  if (!box) return false;
+  return (
+    [box.originX, box.originY, box.width, box.height].every(Number.isFinite) &&
+    box.width >= 4 &&
+    box.height >= 4 &&
+    box.originX < frameWidth &&
+    box.originY < frameHeight &&
+    box.originX + box.width > 0 &&
+    box.originY + box.height > 0
+  );
+}
+
+function poseFaceBox(
+  pose: PosePoint[],
+  frameWidth: number,
+  frameHeight: number,
+): DetectionBox | null {
+  const facePoints = pose
+    .slice(0, 11)
+    .filter(
+      (point) =>
+        point.visibility > 0.55 &&
+        Number.isFinite(point.x) &&
+        Number.isFinite(point.y) &&
+        point.x >= 0 &&
+        point.x <= 1 &&
+        point.y >= 0 &&
+        point.y <= 1,
+    );
+  if (facePoints.length < 3) return null;
+  const xs = facePoints.map((point) => point.x * frameWidth);
+  const ys = facePoints.map((point) => point.y * frameHeight);
+  const box = {
+    originX: Math.min(...xs),
+    originY: Math.min(...ys),
+    width: Math.max(18, Math.max(...xs) - Math.min(...xs)),
+    height: Math.max(22, Math.max(...ys) - Math.min(...ys)),
+  };
+  return isUsableDetectionBox(box, frameWidth, frameHeight) ? box : null;
+}
+
+function poseBodyBox(
+  pose: PosePoint[],
+  frameWidth: number,
+  frameHeight: number,
+): DetectionBox | null {
+  const visiblePoints = pose.filter(
+    (point) =>
+      point.visibility > 0.45 &&
+      Number.isFinite(point.x) &&
+      Number.isFinite(point.y) &&
+      point.x >= 0 &&
+      point.x <= 1 &&
+      point.y >= 0 &&
+      point.y <= 1,
+  );
+  if (visiblePoints.length < 6) return null;
+  const xs = visiblePoints.map((point) => point.x * frameWidth);
+  const ys = visiblePoints.map((point) => point.y * frameHeight);
+  const minX = Math.min(...xs);
+  const minY = Math.min(...ys);
+  const box = {
+    originX: minX,
+    originY: minY,
+    width: Math.max(18, Math.max(...xs) - minX),
+    height: Math.max(22, Math.max(...ys) - minY),
+  };
+  return isUsableDetectionBox(box, frameWidth, frameHeight) ? box : null;
+}
+
+function boxCenterIsInside(
+  inner: DetectionBox,
+  outer: DetectionBox,
+  expansion = 0.25,
+) {
+  const centerX = inner.originX + inner.width / 2;
+  const centerY = inner.originY + inner.height / 2;
+  const expandedX = outer.originX - outer.width * expansion;
+  const expandedY = outer.originY - outer.height * expansion;
+  const expandedWidth = outer.width * (1 + expansion * 2);
+  const expandedHeight = outer.height * (1 + expansion * 2);
+  return (
+    centerX >= expandedX &&
+    centerX <= expandedX + expandedWidth &&
+    centerY >= expandedY &&
+    centerY <= expandedY + expandedHeight
+  );
+}
+
+function boxesDescribeSamePerson(a: DetectionBox, b: DetectionBox) {
+  return boxCenterIsInside(a, b, 0.3) || boxCenterIsInside(b, a, 0.3);
 }
 
 function formatClipBytes(bytes?: number) {
@@ -292,6 +407,8 @@ export default function Home() {
   const [controlPassword, setControlPassword] = useState("");
   const [controlLoginError, setControlLoginError] = useState("");
   const [controlLoginBusy, setControlLoginBusy] = useState(false);
+  const [liveBroadcast, setLiveBroadcast] =
+    useState<LiveBroadcastSnapshot>(IDLE_LIVE_BROADCAST);
   const [selectedClip, setSelectedClip] = useState<{
     event: SafetyEvent;
     url: string;
@@ -303,10 +420,14 @@ export default function Home() {
   const recordingCanvasRef = useRef<HTMLCanvasElement>(null);
   const alertPopupRef = useRef<HTMLDivElement>(null);
   const pixelCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const privacySourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const privacySanitizedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const workerReadyRef = useRef<Promise<void> | null>(null);
   const workerBusyRef = useRef(false);
+  const pendingInferenceRef = useRef<PendingInferenceFrame | null>(null);
+  const cameraGenerationRef = useRef(0);
   const latestResultRef = useRef<VisionResult | null>(null);
   const visionStatsRef = useRef<VisionStats>({
     people: 0,
@@ -337,8 +458,12 @@ export default function Home() {
   const syncingClipsRef = useRef(false);
   const eventsRef = useRef<SafetyEvent[]>([]);
   const deviceIdRef = useRef("모바일 순찰 01");
+  const liveBroadcastSenderRef = useRef<LiveBroadcastSender | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleVisionResultRef = useRef<(result: VisionResult) => void>(() => {});
+  const publishPrivacyFrameRef = useRef<(result: VisionResult) => boolean>(
+    () => false,
+  );
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -352,7 +477,9 @@ export default function Home() {
   }, []);
 
   const captureSnapshot = useCallback(() => {
-    const source = canvasRef.current;
+    // Event posters leave the device, so they use the same fail-closed,
+    // exact-analysis-frame canvas as clips and live control.
+    const source = recordingCanvasRef.current;
     if (!source || source.width === 0 || source.height === 0) return undefined;
 
     try {
@@ -461,7 +588,7 @@ export default function Home() {
   }, []);
 
   const startVerificationRecording = useCallback(() => {
-    const source = canvasRef.current;
+    const source = analysisCanvasRef.current;
     const target = recordingCanvasRef.current;
     if (
       !source ||
@@ -477,7 +604,7 @@ export default function Home() {
     void recordingSessionRef.current?.discard();
     recordingSessionRef.current = null;
 
-    const scale = Math.min(1, 640 / source.width);
+    const scale = Math.min(1, 640 / Math.max(source.width, source.height));
     target.width = Math.max(1, Math.round(source.width * scale));
     target.height = Math.max(1, Math.round(source.height * scale));
     const context = target.getContext("2d", { alpha: false });
@@ -862,7 +989,6 @@ export default function Home() {
   const handleVisionResult = useCallback(
     (result: VisionResult) => {
       latestResultRef.current = result;
-      workerBusyRef.current = false;
 
       const objectPeople = result.objects.filter(
         (detection) => detection.categoryName === "person",
@@ -1064,6 +1190,54 @@ export default function Home() {
     handleVisionResultRef.current = handleVisionResult;
   }, [handleVisionResult]);
 
+  const failClosedAfterVisionError = useCallback(() => {
+    pendingInferenceRef.current = null;
+    workerBusyRef.current = false;
+
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
+    if (inferenceRef.current) {
+      window.clearTimeout(inferenceRef.current);
+      inferenceRef.current = null;
+    }
+
+    const sender = liveBroadcastSenderRef.current;
+    liveBroadcastSenderRef.current = null;
+    sender?.dispose();
+    if (sender) {
+      setLiveBroadcast({
+        state: "error",
+        viewerCount: 0,
+        message: "AI 익명화가 중단되어 실시간 공유를 안전하게 종료했습니다.",
+      });
+    }
+
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+
+    const recordingCanvas = recordingCanvasRef.current;
+    const recordingContext = recordingCanvas?.getContext("2d", {
+      alpha: false,
+    });
+    if (recordingCanvas && recordingContext) {
+      recordingContext.fillStyle = "#07150f";
+      recordingContext.fillRect(
+        0,
+        0,
+        recordingCanvas.width,
+        recordingCanvas.height,
+      );
+    }
+
+    void recordingSessionRef.current?.discard();
+    recordingSessionRef.current = null;
+    setRecordingState("failed");
+    setCameraState("error");
+  }, []);
+
   useEffect(() => {
     if (alertPhase !== "verifying" && alertPhase !== "alerted") return;
     const frame = window.requestAnimationFrame(() => {
@@ -1088,6 +1262,8 @@ export default function Home() {
         const timeout = window.setTimeout(() => {
           worker.terminate();
           if (workerRef.current === worker) workerRef.current = null;
+          workerReadyRef.current = null;
+          failClosedAfterVisionError();
           setModelState("error");
           const timeoutMessage =
             "AI 모델 준비 시간이 초과되었습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.";
@@ -1113,20 +1289,51 @@ export default function Home() {
             window.clearTimeout(timeout);
             worker.terminate();
             if (workerRef.current === worker) workerRef.current = null;
-            workerBusyRef.current = false;
+            workerReadyRef.current = null;
+            failClosedAfterVisionError();
             setModelState("error");
             setModelMessage(event.data.message);
             reject(new Error(event.data.message));
             return;
           }
-          handleVisionResultRef.current(event.data);
+          // The analysis canvas is still locked by workerBusy here. Publish
+          // only after the exact analyzed pixels have been copied and fully
+          // sanitized on non-captured staging canvases.
+          const pendingTimestamp = pendingInferenceRef.current?.timestamp;
+          let sourceMatched = false;
+          try {
+            sourceMatched = publishPrivacyFrameRef.current(event.data);
+          } catch {
+            const recordingCanvas = recordingCanvasRef.current;
+            const context = recordingCanvas?.getContext("2d", {
+              alpha: false,
+            });
+            if (recordingCanvas && context) {
+              context.fillStyle = "#07150f";
+              context.fillRect(
+                0,
+                0,
+                recordingCanvas.width,
+                recordingCanvas.height,
+              );
+            }
+          } finally {
+            if (pendingTimestamp === event.data.timestamp) {
+              pendingInferenceRef.current = null;
+              workerBusyRef.current = false;
+            }
+          }
+          if (sourceMatched) {
+            handleVisionResultRef.current(event.data);
+          }
         };
 
         worker.onerror = (event) => {
           window.clearTimeout(timeout);
           worker.terminate();
           if (workerRef.current === worker) workerRef.current = null;
-          workerBusyRef.current = false;
+          workerReadyRef.current = null;
+          failClosedAfterVisionError();
           setModelState("error");
           const detail = event.message
             ? `AI 실행 환경 오류: ${event.message}`
@@ -1140,6 +1347,7 @@ export default function Home() {
           baseUrl: window.location.origin,
         });
       } catch (error) {
+        failClosedAfterVisionError();
         setModelState("error");
         setModelMessage("이 브라우저는 기기 내 AI 분석을 지원하지 않습니다.");
         reject(error);
@@ -1150,12 +1358,12 @@ export default function Home() {
     });
 
     return workerReadyRef.current;
-  }, []);
+  }, [failClosedAfterVisionError]);
 
   const drawPixelatedRegion = useCallback(
     (
       context: CanvasRenderingContext2D,
-      video: HTMLVideoElement,
+      source: CanvasImageSource,
       box: DetectionBox,
       analysisWidth: number,
       analysisHeight: number,
@@ -1183,15 +1391,15 @@ export default function Home() {
         pixelCanvasRef.current = document.createElement("canvas");
       }
       const pixelCanvas = pixelCanvasRef.current;
-      pixelCanvas.width = Math.max(6, Math.round(width / 15));
-      pixelCanvas.height = Math.max(6, Math.round(height / 15));
+      pixelCanvas.width = clamp(Math.round(width / 22), 4, 12);
+      pixelCanvas.height = clamp(Math.round(height / 22), 4, 12);
       const pixelContext = pixelCanvas.getContext("2d");
       if (!pixelContext) return false;
 
       pixelContext.imageSmoothingEnabled = true;
       pixelContext.clearRect(0, 0, pixelCanvas.width, pixelCanvas.height);
       pixelContext.drawImage(
-        video,
+        source,
         x,
         y,
         width,
@@ -1226,12 +1434,12 @@ export default function Home() {
   const drawFullyPixelatedFrame = useCallback(
     (
       context: CanvasRenderingContext2D,
-      video: HTMLVideoElement,
+      source: CanvasImageSource,
     ) => {
       const canvas = context.canvas;
-      const privacyWidth = 64;
+      const privacyWidth = 32;
       const privacyHeight = Math.max(
-        36,
+        18,
         Math.round((canvas.height / canvas.width) * privacyWidth),
       );
       if (!pixelCanvasRef.current) {
@@ -1248,7 +1456,7 @@ export default function Home() {
       context.fillRect(0, 0, canvas.width, canvas.height);
       if (privacyContext) {
         privacyContext.drawImage(
-          video,
+          source,
           0,
           0,
           privacyCanvas.width,
@@ -1269,135 +1477,87 @@ export default function Home() {
     [],
   );
 
-  const drawCanvasFrame = useCallback(() => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (
-      !video ||
-      !canvas ||
-      video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
-      video.videoWidth === 0
-    ) {
-      return;
-    }
-    const context = canvas.getContext("2d");
-    if (!context) return;
-
-    if (
-      canvas.width !== video.videoWidth ||
-      canvas.height !== video.videoHeight
-    ) {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-    }
-
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    const result = latestResultRef.current;
-    const resultIsFresh =
-      result &&
-      performance.now() - result.timestamp < PRIVACY_RESULT_MAX_AGE_MS;
-    let anonymizationApplied = false;
-
-    if (result && resultIsFresh) {
-      const faceBoxes = result.faces
-        .map((face) => face.boundingBox)
-        .filter((box): box is DetectionBox => Boolean(box));
-
-      for (const faceBox of faceBoxes) {
-        anonymizationApplied =
-          drawPixelatedRegion(
-            context,
-            video,
-            faceBox,
-            result.frameWidth,
-            result.frameHeight,
-            0.34,
-          ) || anonymizationApplied;
-      }
-
-      for (const pose of result.poses) {
-        const facePoints = pose.slice(0, 11).filter((point) => point.visibility > 0.45);
-        if (facePoints.length >= 3) {
-          const xs = facePoints.map((point) => point.x * result.frameWidth);
-          const ys = facePoints.map((point) => point.y * result.frameHeight);
-          const poseFaceBox = {
-            originX: Math.min(...xs),
-            originY: Math.min(...ys),
-            width: Math.max(18, Math.max(...xs) - Math.min(...xs)),
-            height: Math.max(22, Math.max(...ys) - Math.min(...ys)),
-          };
-          anonymizationApplied =
-            drawPixelatedRegion(
-              context,
-              video,
-              poseFaceBox,
-              result.frameWidth,
-              result.frameHeight,
-              0.55,
-            ) || anonymizationApplied;
-        }
-      }
-
-      const peopleWithoutFaceFallback = result.objects.filter(
-        (detection) =>
-          detection.categoryName === "person" && detection.boundingBox,
-      );
-      for (const person of peopleWithoutFaceFallback) {
-        const box = person.boundingBox!;
-        const headBox = {
-          originX: box.originX + box.width * 0.24,
-          originY: box.originY,
-          width: box.width * 0.52,
-          height: box.height * 0.28,
-        };
-        anonymizationApplied =
-          drawPixelatedRegion(
-            context,
-            video,
-            headBox,
-            result.frameWidth,
-            result.frameHeight,
-            0.2,
-          ) || anonymizationApplied;
-      }
-
+  const drawPrivacyOverlays = useCallback(
+    (
+      context: CanvasRenderingContext2D,
+      result: VisionResult,
+      poseBoxes: DetectionBox[],
+    ) => {
+      const canvas = context.canvas;
       const scaleX = canvas.width / result.frameWidth;
       const scaleY = canvas.height / result.frameHeight;
       context.lineWidth = Math.max(2, canvas.width / 420);
       context.font = `600 ${Math.max(13, canvas.width / 45)}px system-ui`;
       context.textBaseline = "top";
 
-      for (const detection of result.objects.slice(0, 10)) {
-        if (!detection.boundingBox) continue;
-        const { originX, originY, width, height } = detection.boundingBox;
-        const isPerson = detection.categoryName === "person";
-        const color = isPerson
-          ? PERSON_DETECTION_COLOR
-          : OBJECT_DETECTION_COLOR;
-        const x = originX * scaleX;
-        const y = originY * scaleY;
-        const boxWidth = width * scaleX;
-        const boxHeight = height * scaleY;
+      const drawBox = (
+        box: DetectionBox,
+        label: string,
+        score: number,
+        color: string,
+      ) => {
+        const x = clamp(box.originX * scaleX, 0, canvas.width);
+        const y = clamp(box.originY * scaleY, 0, canvas.height);
+        const boxWidth = clamp(box.width * scaleX, 1, canvas.width - x);
+        const boxHeight = clamp(box.height * scaleY, 1, canvas.height - y);
         context.strokeStyle = color;
         context.fillStyle = color;
         context.strokeRect(x, y, boxWidth, boxHeight);
-        const label =
-          KOREAN_LABELS[detection.categoryName] ||
-          detection.displayName ||
-          detection.categoryName;
-        const text = `${label} ${Math.round(detection.score * 100)}%`;
+        const text = `${label} ${Math.round(score * 100)}%`;
         const textWidth = context.measureText(text).width + 14;
         context.fillRect(x, Math.max(0, y - 27), textWidth, 27);
         context.fillStyle = "#07150f";
         context.fillText(text, x + 7, Math.max(2, y - 24));
+      };
+
+      // Cached object boxes do not describe the exact analyzed frame. They are
+      // omitted from clips/live until object detection was updated this frame.
+      if (result.objectUpdated) {
+        for (const detection of result.objects.slice(0, 10)) {
+          if (
+            !isUsableDetectionBox(
+              detection.boundingBox,
+              result.frameWidth,
+              result.frameHeight,
+            )
+          ) {
+            continue;
+          }
+          const isPerson = detection.categoryName === "person";
+          drawBox(
+            detection.boundingBox!,
+            KOREAN_LABELS[detection.categoryName] ||
+              detection.displayName ||
+              detection.categoryName,
+            detection.score,
+            isPerson ? PERSON_DETECTION_COLOR : OBJECT_DETECTION_COLOR,
+          );
+        }
+      }
+
+      // A current pose can still provide an exact red person box on frames
+      // where the slower object detector was intentionally not refreshed.
+      if (
+        !result.objectUpdated ||
+        !result.objects.some(
+          (detection) =>
+            detection.categoryName === "person" &&
+            isUsableDetectionBox(
+              detection.boundingBox,
+              result.frameWidth,
+              result.frameHeight,
+            ),
+        )
+      ) {
+        for (const box of poseBoxes) {
+          drawBox(box, "사람", 1, PERSON_DETECTION_COLOR);
+        }
       }
 
       for (const pose of result.poses) {
         context.strokeStyle = PERSON_DETECTION_COLOR;
         context.fillStyle = PERSON_DETECTION_COLOR;
         context.lineWidth = Math.max(2.5, canvas.width / 360);
-
         for (const [start, end] of POSE_CONNECTIONS) {
           const a = pose[start];
           const b = pose[end];
@@ -1408,50 +1568,350 @@ export default function Home() {
           context.stroke();
         }
       }
-    } else {
-      drawFullyPixelatedFrame(context, video);
-    }
+    },
+    [],
+  );
 
-    // Only this fully rendered, face-anonymized frame is exposed to the
-    // recorder. The original camera MediaStream is never recorded.
+  const writeOpaqueRecordingFrame = useCallback(() => {
     const recordingCanvas = recordingCanvasRef.current;
-    if (recordingCanvas) {
+    if (!recordingCanvas) return;
+    const context = recordingCanvas.getContext("2d", { alpha: false });
+    if (!context) return;
+    context.save();
+    context.globalAlpha = 1;
+    context.fillStyle = "#07150f";
+    context.fillRect(0, 0, recordingCanvas.width, recordingCanvas.height);
+    context.restore();
+  }, []);
+
+  const publishPrivacyFrame = useCallback(
+    (result: VisionResult) => {
+      const pending = pendingInferenceRef.current;
+      const analysisCanvas = analysisCanvasRef.current;
+      const metadataMatches =
+        Boolean(pending) &&
+        pending?.timestamp === result.timestamp &&
+        pending.frameWidth === result.frameWidth &&
+        pending.frameHeight === result.frameHeight &&
+        pending.cameraGeneration === cameraGenerationRef.current &&
+        analysisCanvas?.width === result.frameWidth &&
+        analysisCanvas.height === result.frameHeight;
+
+      if (!metadataMatches || !analysisCanvas) {
+        writeOpaqueRecordingFrame();
+        return false;
+      }
+
+      if (!privacySourceCanvasRef.current) {
+        privacySourceCanvasRef.current = document.createElement("canvas");
+      }
+      const sourceCanvas = privacySourceCanvasRef.current;
+      sourceCanvas.width = result.frameWidth;
+      sourceCanvas.height = result.frameHeight;
+      const sourceContext = sourceCanvas.getContext("2d", { alpha: false });
+      if (!sourceContext) {
+        writeOpaqueRecordingFrame();
+        return false;
+      }
+
+      // This is the sole copy of the analyzed pixels. It happens synchronously
+      // while workerBusy remains true, so the inference loop cannot replace
+      // analysisCanvas with a newer camera frame.
+      try {
+        sourceContext.globalAlpha = 1;
+        sourceContext.drawImage(analysisCanvas, 0, 0);
+      } catch {
+        writeOpaqueRecordingFrame();
+        return false;
+      }
+
+      if (!privacySanitizedCanvasRef.current) {
+        privacySanitizedCanvasRef.current = document.createElement("canvas");
+      }
+      const sanitizedCanvas = privacySanitizedCanvasRef.current;
+      sanitizedCanvas.width = result.frameWidth;
+      sanitizedCanvas.height = result.frameHeight;
+      const sanitizedContext = sanitizedCanvas.getContext("2d", {
+        alpha: false,
+      });
+
+      const faceDetections = result.faces.filter(
+        (face) => face.categoryName === "face" || Boolean(face.boundingBox),
+      );
+      const faceBoxes = faceDetections
+        .map((face) => face.boundingBox)
+        .filter(
+          (box): box is DetectionBox =>
+            isUsableDetectionBox(
+              box,
+              result.frameWidth,
+              result.frameHeight,
+            ),
+        );
+      const poseFaceBoxes = result.poses
+        .map((pose) =>
+          poseFaceBox(pose, result.frameWidth, result.frameHeight),
+        )
+        .filter((box): box is DetectionBox => Boolean(box));
+      const poseBoxes = result.poses
+        .map((pose) =>
+          poseBodyBox(pose, result.frameWidth, result.frameHeight),
+        )
+        .filter((box): box is DetectionBox => Boolean(box));
+      const objectPeople = result.objects.filter(
+        (detection) => detection.categoryName === "person",
+      );
+      const objectPersonBoxes = objectPeople
+        .map((person) => person.boundingBox)
+        .filter(
+          (box): box is DetectionBox =>
+            isUsableDetectionBox(
+              box,
+              result.frameWidth,
+              result.frameHeight,
+            ),
+        );
+
+      let peopleSpatiallyAligned =
+        faceBoxes.length === faceDetections.length &&
+        poseBoxes.length === result.poses.length;
+      if (
+        peopleSpatiallyAligned &&
+        result.objectUpdated &&
+        objectPeople.length !== objectPersonBoxes.length
+      ) {
+        peopleSpatiallyAligned = false;
+      }
+      if (
+        peopleSpatiallyAligned &&
+        result.objectUpdated &&
+        poseBoxes.length === 1 &&
+        objectPersonBoxes.length === 1
+      ) {
+        peopleSpatiallyAligned = boxesDescribeSamePerson(
+          poseBoxes[0],
+          objectPersonBoxes[0],
+        );
+      }
+
+      const currentPersonRegions = [
+        ...poseBoxes,
+        ...(result.objectUpdated ? objectPersonBoxes : []),
+      ];
+      if (
+        peopleSpatiallyAligned &&
+        faceBoxes.length > 0 &&
+        currentPersonRegions.length > 0
+      ) {
+        peopleSpatiallyAligned = faceBoxes.every((faceBox) =>
+          currentPersonRegions.some((region) =>
+            boxCenterIsInside(faceBox, region, 0.3),
+          ),
+        );
+      }
+      if (
+        peopleSpatiallyAligned &&
+        result.objectUpdated &&
+        poseFaceBoxes.length === 1 &&
+        objectPersonBoxes.length === 1
+      ) {
+        peopleSpatiallyAligned = boxCenterIsInside(
+          poseFaceBoxes[0],
+          objectPersonBoxes[0],
+          0.3,
+        );
+      }
+
+      const ageMs = performance.now() - result.timestamp;
+      const decision: PrivacyFrameDecision = decidePrivacyFrame({
+        sourceMatchesResult: true,
+        resultIsFresh:
+          Number.isFinite(ageMs) &&
+          ageMs >= 0 &&
+          ageMs <= PRIVACY_RESULT_MAX_AGE_MS,
+        sanitizedContextAvailable: Boolean(sanitizedContext),
+        posePersonCount: result.poses.length,
+        objectPersonCount: objectPeople.length,
+        faceMaskCount: faceBoxes.length,
+        poseFaceMaskCount: poseFaceBoxes.length,
+        peopleSpatiallyAligned,
+        objectUpdated: result.objectUpdated,
+        objectFallbackAvailable: objectPersonBoxes.length === 1,
+      });
+
+      if (!sanitizedContext) {
+        writeOpaqueRecordingFrame();
+        return true;
+      }
+
+      sanitizedContext.save();
+      sanitizedContext.globalAlpha = 1;
+      sanitizedContext.fillStyle = "#07150f";
+      sanitizedContext.fillRect(
+        0,
+        0,
+        sanitizedCanvas.width,
+        sanitizedCanvas.height,
+      );
+
+      let outputIsSafe = false;
+      if (decision.mode === "sanitize") {
+        try {
+          sanitizedContext.drawImage(sourceCanvas, 0, 0);
+          let maskSucceeded = true;
+          let appliedMasks = 0;
+
+          for (const box of faceBoxes) {
+            const applied = drawPixelatedRegion(
+              sanitizedContext,
+              sourceCanvas,
+              box,
+              result.frameWidth,
+              result.frameHeight,
+              0.34,
+            );
+            maskSucceeded = maskSucceeded && applied;
+            if (applied) appliedMasks += 1;
+          }
+          for (const box of poseFaceBoxes) {
+            const applied = drawPixelatedRegion(
+              sanitizedContext,
+              sourceCanvas,
+              box,
+              result.frameWidth,
+              result.frameHeight,
+              0.55,
+            );
+            maskSucceeded = maskSucceeded && applied;
+            if (applied) appliedMasks += 1;
+          }
+          if (decision.useObjectFallback) {
+            const personBox = objectPersonBoxes[0];
+            const headBox = {
+              originX: personBox.originX + personBox.width * 0.24,
+              originY: personBox.originY,
+              width: personBox.width * 0.52,
+              height: personBox.height * 0.28,
+            };
+            const applied = drawPixelatedRegion(
+              sanitizedContext,
+              sourceCanvas,
+              headBox,
+              result.frameWidth,
+              result.frameHeight,
+              0.2,
+            );
+            maskSucceeded = maskSucceeded && applied;
+            if (applied) appliedMasks += 1;
+          }
+          outputIsSafe = maskSucceeded && appliedMasks > 0;
+        } catch {
+          outputIsSafe = false;
+        }
+      }
+
+      const finalPrivacyMode = resolvePrivacyFrameMode(
+        decision,
+        outputIsSafe,
+      );
+      if (finalPrivacyMode === "pixelate") {
+        outputIsSafe = drawFullyPixelatedFrame(
+          sanitizedContext,
+          sourceCanvas,
+        );
+      } else if (finalPrivacyMode === "opaque") {
+        outputIsSafe = false;
+      }
+      if (!outputIsSafe) {
+        sanitizedContext.fillStyle = "#07150f";
+        sanitizedContext.fillRect(
+          0,
+          0,
+          sanitizedCanvas.width,
+          sanitizedCanvas.height,
+        );
+      } else {
+        drawPrivacyOverlays(sanitizedContext, result, poseBoxes);
+      }
+      sanitizedContext.restore();
+
+      const recordingCanvas = recordingCanvasRef.current;
+      if (!recordingCanvas) return true;
       const session = recordingSessionRef.current;
       const recordingIsActive =
         session?.state === "recording" || session?.state === "stopping";
-      if (!recordingIsActive) {
-        const scale = Math.min(1, 640 / canvas.width);
-        const width = Math.max(1, Math.round(canvas.width * scale));
-        const height = Math.max(1, Math.round(canvas.height * scale));
-        if (
-          recordingCanvas.width !== width ||
-          recordingCanvas.height !== height
-        ) {
-          recordingCanvas.width = width;
-          recordingCanvas.height = height;
-        }
+      if (
+        !recordingIsActive &&
+        (recordingCanvas.width !== sanitizedCanvas.width ||
+          recordingCanvas.height !== sanitizedCanvas.height)
+      ) {
+        recordingCanvas.width = sanitizedCanvas.width;
+        recordingCanvas.height = sanitizedCanvas.height;
       }
       const recordingContext = recordingCanvas.getContext("2d", {
         alpha: false,
       });
-      if (recordingContext) {
-        if (resultIsFresh && anonymizationApplied) {
-          recordingContext.drawImage(
-            canvas,
-            0,
-            0,
-            recordingCanvas.width,
-            recordingCanvas.height,
-          );
-        } else {
-          // A missing or stale privacy result must never expose a raw frame in
-          // a persisted clip. Full-frame pixelation replaces every source
-          // pixel until a verified face/person redaction is available.
-          drawFullyPixelatedFrame(recordingContext, video);
-        }
-      }
+      if (!recordingContext) return true;
+      recordingContext.save();
+      recordingContext.globalAlpha = 1;
+      recordingContext.fillStyle = "#07150f";
+      recordingContext.fillRect(
+        0,
+        0,
+        recordingCanvas.width,
+        recordingCanvas.height,
+      );
+      // The captured canvas receives one image draw only after every privacy
+      // operation has completed on the non-captured sanitized staging canvas.
+      // The original camera MediaStream is never recorded or shared.
+      recordingContext.drawImage(
+        sanitizedCanvas,
+        0,
+        0,
+        recordingCanvas.width,
+        recordingCanvas.height,
+      );
+      recordingContext.restore();
+      return true;
+    },
+    [
+      drawFullyPixelatedFrame,
+      drawPixelatedRegion,
+      drawPrivacyOverlays,
+      writeOpaqueRecordingFrame,
+    ],
+  );
+
+  useEffect(() => {
+    publishPrivacyFrameRef.current = publishPrivacyFrame;
+  }, [publishPrivacyFrame]);
+
+  const drawCanvasFrame = useCallback(() => {
+    const safeFrame = recordingCanvasRef.current;
+    const canvas = canvasRef.current;
+    if (!safeFrame || !canvas) return;
+    const width = Math.max(1, safeFrame.width);
+    const height = Math.max(1, safeFrame.height);
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
     }
-  }, [drawFullyPixelatedFrame, drawPixelatedRegion]);
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) return;
+
+    context.save();
+    context.globalAlpha = 1;
+    context.fillStyle = "#07150f";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    try {
+      // The phone display consumes the same completed privacy frame as clips
+      // and live control. It never draws the raw camera video directly.
+      context.drawImage(safeFrame, 0, 0, canvas.width, canvas.height);
+    } catch {
+      // The opaque fill remains visible until a safe frame is available.
+    }
+    context.restore();
+  }, []);
 
   const startRenderAndInferenceLoops = useCallback(() => {
     const render = () => {
@@ -1492,18 +1952,36 @@ export default function Home() {
           analysisCanvas.width,
           analysisCanvas.height,
         );
+        const timestamp = performance.now();
+        const cameraGeneration = cameraGenerationRef.current;
         try {
           workerBusyRef.current = true;
+          pendingInferenceRef.current = {
+            timestamp,
+            frameWidth: analysisCanvas.width,
+            frameHeight: analysisCanvas.height,
+            cameraGeneration,
+          };
           const frame = await createImageBitmap(analysisCanvas);
+          if (
+            pendingInferenceRef.current?.timestamp !== timestamp ||
+            cameraGenerationRef.current !== cameraGeneration ||
+            !streamRef.current
+          ) {
+            frame.close();
+            workerBusyRef.current = false;
+            return;
+          }
           worker.postMessage(
             {
               type: "frame",
               frame,
-              timestamp: performance.now(),
+              timestamp,
             },
             [frame],
           );
         } catch {
+          pendingInferenceRef.current = null;
           workerBusyRef.current = false;
         }
       }
@@ -1525,12 +2003,107 @@ export default function Home() {
       window.clearTimeout(inferenceRef.current);
       inferenceRef.current = null;
     }
+    pendingInferenceRef.current = null;
     workerBusyRef.current = false;
   }, []);
 
+  const resetPrivacyFramePipeline = useCallback(() => {
+    cameraGenerationRef.current += 1;
+    pendingInferenceRef.current = null;
+    privacySourceCanvasRef.current = null;
+    privacySanitizedCanvasRef.current = null;
+    pixelCanvasRef.current = null;
+    latestResultRef.current = null;
+
+    const analysisCanvas = analysisCanvasRef.current;
+    if (analysisCanvas) {
+      analysisCanvas.width = 1;
+      analysisCanvas.height = 1;
+      const context = analysisCanvas.getContext("2d", { alpha: false });
+      if (context) {
+        context.fillStyle = "#07150f";
+        context.fillRect(0, 0, 1, 1);
+      }
+    }
+    writeOpaqueRecordingFrame();
+    const visibleCanvas = canvasRef.current;
+    if (visibleCanvas) {
+      const context = visibleCanvas.getContext("2d", { alpha: false });
+      if (context) {
+        context.fillStyle = "#07150f";
+        context.fillRect(
+          0,
+          0,
+          visibleCanvas.width,
+          visibleCanvas.height,
+        );
+      }
+    }
+  }, [writeOpaqueRecordingFrame]);
+
+  const stopLiveBroadcast = useCallback(
+    (notify = false) => {
+      const sender = liveBroadcastSenderRef.current;
+      if (!sender) return;
+      liveBroadcastSenderRef.current = null;
+      sender.stop();
+      sender.dispose();
+      if (notify) {
+        showToast("관제 실시간 공유를 종료했습니다.");
+      }
+    },
+    [showToast],
+  );
+
+  const startLiveBroadcast = useCallback(() => {
+    if (cameraState !== "running") {
+      setLiveBroadcast({
+        state: "error",
+        viewerCount: 0,
+        message: "카메라 순찰을 먼저 시작해 주세요.",
+      });
+      showToast("카메라 순찰을 먼저 시작해 주세요.");
+      return;
+    }
+    if (controlConnection !== "connected") {
+      setLiveBroadcast({
+        state: "error",
+        viewerCount: 0,
+        message: "관제센터에 연결한 뒤 실시간 공유를 시작할 수 있습니다.",
+      });
+      setControlLoginError("");
+      setShowControlLogin(true);
+      return;
+    }
+
+    const canvas = recordingCanvasRef.current;
+    if (!canvas) {
+      setLiveBroadcast({
+        state: "error",
+        viewerCount: 0,
+        message: "익명화 화면을 준비하지 못했습니다. 다시 시도해 주세요.",
+      });
+      return;
+    }
+
+    liveBroadcastSenderRef.current?.dispose();
+    const sender = new LiveBroadcastSender({
+      canvas,
+      onStatus: setLiveBroadcast,
+      onAuthenticationExpired: () => {
+        setControlConnection("disconnected");
+      },
+    });
+    liveBroadcastSenderRef.current = sender;
+    sender.start();
+    showToast("익명화된 무음 영상을 관제센터와 실시간 공유합니다.");
+  }, [cameraState, controlConnection, showToast]);
+
   const stopCamera = useCallback(
     (reason?: "user" | "background") => {
+      stopLiveBroadcast();
       stopLoops();
+      resetPrivacyFramePipeline();
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       if (videoRef.current) videoRef.current.srcObject = null;
@@ -1543,7 +2116,6 @@ export default function Home() {
       };
       visionStatsRef.current = emptyVisionStats;
       setVisionStats(emptyVisionStats);
-      latestResultRef.current = null;
 
       if (
         alertPhaseRef.current === "verifying" &&
@@ -1553,7 +2125,13 @@ export default function Home() {
       }
       if (reason === "user") showToast("카메라 순찰을 종료했습니다.");
     },
-    [resolveVerification, showToast, stopLoops],
+    [
+      resetPrivacyFramePipeline,
+      resolveVerification,
+      showToast,
+      stopLiveBroadcast,
+      stopLoops,
+    ],
   );
 
   const startCamera = useCallback(async () => {
@@ -1568,6 +2146,7 @@ export default function Home() {
       return;
     }
 
+    resetPrivacyFramePipeline();
     setCameraState("starting");
     let requestedStream: MediaStream | null = null;
     try {
@@ -1587,6 +2166,22 @@ export default function Home() {
       if (!video) throw new Error("Video element unavailable");
       video.srcObject = requestedStream;
       await video.play();
+      const safeFrame = recordingCanvasRef.current;
+      if (safeFrame && video.videoWidth > 0 && video.videoHeight > 0) {
+        const safeScale = Math.min(
+          1,
+          640 / Math.max(video.videoWidth, video.videoHeight),
+        );
+        safeFrame.width = Math.max(
+          1,
+          Math.round(video.videoWidth * safeScale),
+        );
+        safeFrame.height = Math.max(
+          1,
+          Math.round(video.videoHeight * safeScale),
+        );
+        writeOpaqueRecordingFrame();
+      }
       setCameraState("running");
       startRenderAndInferenceLoops();
       showToast("기기 안에서 AI 순찰을 시작했습니다.");
@@ -1609,8 +2204,10 @@ export default function Home() {
     }
   }, [
     ensureVisionWorker,
+    resetPrivacyFramePipeline,
     showToast,
     startRenderAndInferenceLoops,
+    writeOpaqueRecordingFrame,
   ]);
 
   const enableNotifications = useCallback(async () => {
@@ -1686,7 +2283,9 @@ export default function Home() {
         setControlPassword("");
         setControlConnection("connected");
         setShowControlLogin(false);
-        showToast("관제센터에 연결했습니다. 대기 영상을 전송합니다.");
+        showToast(
+          "관제센터에 연결했습니다. 실시간 공유를 직접 시작할 수 있습니다.",
+        );
         void syncPendingClips();
       } catch (error) {
         setControlLoginError(
@@ -1877,6 +2476,26 @@ export default function Home() {
   }, [controlConnection, historyLoaded, syncPendingClips]);
 
   useEffect(() => {
+    if (
+      controlConnection !== "connected" &&
+      liveBroadcastSenderRef.current
+    ) {
+      liveBroadcastSenderRef.current.dispose();
+      liveBroadcastSenderRef.current = null;
+      setLiveBroadcast((current) =>
+        current.state === "error"
+          ? current
+          : {
+              state: "error",
+              viewerCount: 0,
+              message:
+                "관제 연결이 종료되어 실시간 공유도 안전하게 중단했습니다.",
+            },
+      );
+    }
+  }, [controlConnection]);
+
+  useEffect(() => {
     const onVisibilityChange = () => {
       if (
         document.visibilityState === "hidden" &&
@@ -1895,6 +2514,8 @@ export default function Home() {
 
   useEffect(
     () => () => {
+      liveBroadcastSenderRef.current?.dispose();
+      liveBroadcastSenderRef.current = null;
       stopLoops();
       streamRef.current?.getTracks().forEach((track) => track.stop());
       workerRef.current?.terminate();
@@ -1935,6 +2556,10 @@ export default function Home() {
         : cameraState === "error"
           ? "확인 필요"
           : "대기 중";
+  const liveBroadcastActive =
+    liveBroadcast.state === "connecting" ||
+    liveBroadcast.state === "live" ||
+    liveBroadcast.state === "reconnecting";
 
   return (
     <main className="app-root">
@@ -2058,12 +2683,41 @@ export default function Home() {
                   </p>
                 </div>
                 <div className="heading-actions">
-                  {!isStandalone && (
+                  {!isStandalone && cameraState !== "running" && (
                     <button className="button button-ghost" onClick={installApp}>
                       <Download size={17} aria-hidden="true" />
                       홈 화면에 추가
                     </button>
                   )}
+                  {cameraState === "running" &&
+                    controlConnection === "connected" && (
+                      <button
+                        className={`button ${
+                          liveBroadcastActive
+                            ? "button-danger-soft"
+                            : "button-primary"
+                        }`}
+                        onClick={
+                          liveBroadcastActive
+                            ? () => stopLiveBroadcast(true)
+                            : startLiveBroadcast
+                        }
+                        aria-label={
+                          liveBroadcastActive
+                            ? "관제센터 실시간 영상 공유 중지"
+                            : "익명화된 카메라 영상을 관제센터에 실시간 공유 시작"
+                        }
+                      >
+                        {liveBroadcastActive ? (
+                          <Pause size={17} aria-hidden="true" />
+                        ) : (
+                          <Radio size={17} aria-hidden="true" />
+                        )}
+                        {liveBroadcastActive
+                          ? "실시간 공유 중지"
+                          : "관제 실시간 공유"}
+                      </button>
+                    )}
                   {cameraState === "running" ? (
                     <button
                       className="button button-danger-soft"
@@ -2189,6 +2843,16 @@ export default function Home() {
                           <ShieldCheck size={13} aria-hidden="true" />
                           RAW VIDEO OFF
                         </span>
+                        {liveBroadcastActive && (
+                          <span
+                            className="recording-chip"
+                            role="status"
+                            aria-label={`관제센터 실시간 공유 중, 시청 화면 ${liveBroadcast.viewerCount}개`}
+                          >
+                            <span />
+                            관제 LIVE {liveBroadcast.viewerCount}
+                          </span>
+                        )}
                         {recordingState === "recording" && (
                           <span className="recording-chip">
                             <span />
@@ -2244,6 +2908,34 @@ export default function Home() {
                       </span>
                     </div>
                   </div>
+                  {liveBroadcast.state !== "idle" &&
+                    liveBroadcast.state !== "error" &&
+                    liveBroadcast.state !== "unsupported" && (
+                      <div
+                        className="model-status"
+                        role="status"
+                        aria-live="polite"
+                      >
+                        <span
+                          className={`model-dot state-${
+                            liveBroadcast.state === "live"
+                              ? "ready"
+                              : "loading"
+                          }`}
+                          aria-hidden="true"
+                        />
+                        <div>
+                          <strong>
+                            {liveBroadcast.state === "live"
+                              ? `관제 실시간 공유 · ${liveBroadcast.viewerCount}곳`
+                              : liveBroadcast.state === "reconnecting"
+                                ? "관제 재연결 중"
+                                : "관제 연결 중"}
+                          </strong>
+                          <span>{liveBroadcast.message}</span>
+                        </div>
+                      </div>
+                    )}
                   {alertPhase === "idle" && (
                     <button className="test-button" onClick={runFallTest}>
                       <Play size={16} fill="currentColor" aria-hidden="true" />
@@ -2252,6 +2944,14 @@ export default function Home() {
                   )}
                 </div>
               </section>
+
+              {(liveBroadcast.state === "error" ||
+                liveBroadcast.state === "unsupported") && (
+                <div className="control-auth-error" role="alert">
+                  <TriangleAlert size={16} aria-hidden="true" />
+                  {liveBroadcast.message}
+                </div>
+              )}
 
               <section className="metric-grid" aria-label="오늘의 순찰 현황">
                 <article className="metric-card">
@@ -2797,10 +3497,11 @@ export default function Home() {
                 <UploadCloud size={21} aria-hidden="true" />
               </span>
               <div>
-                <strong>확정된 10초 영상만 전송합니다</strong>
+                <strong>실시간 공유는 현장에서 직접 시작합니다</strong>
                 <p>
-                  원본과 음성은 전송하지 않으며, 얼굴 흐림 처리가 끝난 영상만
-                  비공개 관제 이력에 7일간 보관합니다.
+                  원본과 음성은 전송하지 않습니다. 얼굴 흐림 처리가 끝난
+                  실시간 화면만 공유하며, 확정된 10초 영상은 비공개 관제
+                  이력에 7일간 보관합니다.
                 </p>
               </div>
             </div>
