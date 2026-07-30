@@ -42,6 +42,15 @@ let objectDetector: ObjectDetector | null = null;
 let lastObjectDetectionAt = -Infinity;
 let cachedObjects: PlainDetection[] = [];
 
+function createTaskCanvas() {
+  if (typeof OffscreenCanvas === "undefined") {
+    throw new Error(
+      "이 브라우저는 기기 내 AI 캔버스를 지원하지 않습니다. 운영체제와 브라우저를 최신 버전으로 업데이트해 주세요.",
+    );
+  }
+  return new OffscreenCanvas(1, 1);
+}
+
 function serializeDetections(detections: Detection[]): PlainDetection[] {
   return detections.map((detection) => {
     const category = detection.categories[0];
@@ -80,6 +89,7 @@ async function initialize(baseUrl: string) {
 
   const [pose, face, objects] = await Promise.all([
     PoseLandmarker.createFromOptions(vision, {
+      canvas: createTaskCanvas(),
       baseOptions: {
         modelAssetPath: `${baseUrl}/models/pose_landmarker_lite.task`,
         delegate: "CPU",
@@ -92,6 +102,7 @@ async function initialize(baseUrl: string) {
       outputSegmentationMasks: false,
     }),
     FaceDetector.createFromOptions(vision, {
+      canvas: createTaskCanvas(),
       baseOptions: {
         modelAssetPath: `${baseUrl}/models/blaze_face_full_range.tflite`,
         delegate: "CPU",
@@ -101,6 +112,7 @@ async function initialize(baseUrl: string) {
       minSuppressionThreshold: 0.3,
     }),
     ObjectDetector.createFromOptions(vision, {
+      canvas: createTaskCanvas(),
       baseOptions: {
         modelAssetPath: `${baseUrl}/models/efficientdet_lite0_uint8.tflite`,
         delegate: "CPU",

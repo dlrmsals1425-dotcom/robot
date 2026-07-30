@@ -80,6 +80,8 @@ test("ships the PWA shell and pinned local AI assets", async () => {
     visionWorker,
     /FilesetResolver\.forVisionTasks\([\s\S]*?true,[\s\S]*?\)/,
   );
+  assert.match(visionWorker, /canvas: createTaskCanvas\(\)/);
+  assert.match(visionWorker, /new OffscreenCanvas\(1, 1\)/);
   assert.match(packageJson, /"@mediapipe\/tasks-vision": "0\.10\.35"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.ok(poseModel.size > 1_000_000);
