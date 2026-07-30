@@ -1,46 +1,1465 @@
-/** Cloudflare Worker entry point for the vinext-starter template. */
-import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
+/** Cloudflare Worker entry point for SAFEBOT. */
+import {
+  DEFAULT_DEVICE_SIZES,
+  DEFAULT_IMAGE_SIZES,
+  handleImageOptimization,
+} from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 
 interface Env {
   ASSETS: Fetcher;
-  DB: D1Database;
-  IMAGES: {
+  DB?: D1Database;
+  EVENT_MEDIA?: R2Bucket;
+  CONTROL_PASSWORD?: string;
+  SESSION_SECRET?: string;
+  IMAGES?: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
-        output(options: { format: string; quality: number }): Promise<{ response(): Response }>;
+        output(options: {
+          format: string;
+          quality: number;
+        }): Promise<{ response(): Response }>;
       };
     };
   };
 }
 
-interface ExecutionContext {
+interface WorkerExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
   passThroughOnException(): void;
 }
 
-// Image security config. SVG sources with .svg extension auto-skip the
-// optimization endpoint on the client side (served directly, no proxy).
-// To route SVGs through the optimizer (with security headers), set
-// dangerouslyAllowSVG: true in next.config.js and uncomment below:
-// const imageConfig: ImageConfig = { dangerouslyAllowSVG: true };
+type EventStatus =
+  | "emergency"
+  | "recovered"
+  | "false_positive"
+  | "interrupted";
+
+type NotificationStatus = "sent" | "not_sent" | "permission_needed";
+
+type EventMeta = {
+  id?: string;
+  status: EventStatus;
+  title: string;
+  detail: string;
+  createdAt: string;
+  durationSeconds: number;
+  confidence: number;
+  notification: NotificationStatus;
+  people?: number;
+  objects?: number;
+  deviceId?: string;
+};
+
+type EventRow = {
+  id: string;
+  status: EventStatus;
+  title: string;
+  detail: string;
+  created_at: number;
+  duration_seconds: number;
+  confidence: number;
+  notification: NotificationStatus;
+  people: number | null;
+  objects: number | null;
+  device_id: string | null;
+  clip_key: string | null;
+  clip_mime: string | null;
+  clip_size: number | null;
+  poster_key: string | null;
+  poster_mime: string | null;
+  poster_size: number | null;
+  expires_at: number;
+};
+
+type LoginAttemptRow = {
+  attempts: number;
+  window_started: number;
+  blocked_until: number;
+};
+
+type ExpiredEventRow = {
+  id: string;
+  clip_key: string | null;
+  poster_key: string | null;
+};
+
+type SessionClaims = {
+  v: 1;
+  iat: number;
+  exp: number;
+};
+
+const SESSION_COOKIE = "__Host-safebot_session";
+const SESSION_TTL_SECONDS = 8 * 60 * 60;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_BLOCK_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 5;
+const EVENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const CLEANUP_BATCH_SIZE = 100;
+const MAX_CLEANUP_BATCHES = 10;
+const MAX_JSON_BODY_BYTES = 2 * 1024;
+const MAX_META_BYTES = 8 * 1024;
+const MAX_CLIP_BYTES = 12 * 1024 * 1024;
+const MAX_POSTER_BYTES = 1024 * 1024;
+const MAX_MULTIPART_BYTES =
+  MAX_META_BYTES + MAX_CLIP_BYTES + MAX_POSTER_BYTES + 64 * 1024;
+const ALLOWED_CLIP_TYPES = new Set(["video/mp4", "video/webm"]);
+const ALLOWED_POSTER_TYPES = new Set(["image/jpeg", "image/webp"]);
+const EVENT_ID_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
+const EVENT_STATUSES = new Set<EventStatus>([
+  "emergency",
+  "recovered",
+  "false_positive",
+  "interrupted",
+]);
+const NOTIFICATION_STATUSES = new Set<NotificationStatus>([
+  "sent",
+  "not_sent",
+  "permission_needed",
+]);
+
+class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+    readonly retryAfterSeconds?: number,
+  ) {
+    super(message);
+  }
+}
+
+function apiHeaders(extra?: HeadersInit) {
+  const headers = new Headers(extra);
+  headers.set("Cache-Control", "no-store");
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("Referrer-Policy", "no-referrer");
+  headers.set("X-Content-Type-Options", "nosniff");
+  return headers;
+}
+
+function jsonResponse(
+  body: unknown,
+  status = 200,
+  extraHeaders?: HeadersInit,
+) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: apiHeaders(extraHeaders),
+  });
+}
+
+function errorResponse(error: ApiError) {
+  const headers = new Headers();
+  if (error.retryAfterSeconds !== undefined) {
+    headers.set("Retry-After", String(error.retryAfterSeconds));
+  }
+  return jsonResponse(
+    {
+      error: {
+        code: error.code,
+        message: error.message,
+        ...(error.retryAfterSeconds !== undefined
+          ? { retryAfterSeconds: error.retryAfterSeconds }
+          : {}),
+      },
+    },
+    error.status,
+    headers,
+  );
+}
+
+function methodNotAllowed(allowed: string[]) {
+  return jsonResponse(
+    {
+      error: {
+        code: "METHOD_NOT_ALLOWED",
+        message: "지원하지 않는 요청 방식입니다.",
+      },
+    },
+    405,
+    { Allow: allowed.join(", ") },
+  );
+}
+
+function normalizeMime(type: string) {
+  return type.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+}
+
+function utf8Length(value: string) {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function bytesToBase64Url(bytes: Uint8Array) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
+function base64UrlToBytes(value: string) {
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) return null;
+  const padded = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(
+    Math.ceil(value.length / 4) * 4,
+    "=",
+  );
+  try {
+    const binary = atob(padded);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+function timingSafeEqual(left: Uint8Array, right: Uint8Array) {
+  if (left.byteLength !== right.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    difference |= left[index] ^ right[index];
+  }
+  return difference === 0;
+}
+
+async function hmac(secret: string, value: string) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return new Uint8Array(
+    await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)),
+  );
+}
+
+async function constantTimePasswordMatches(expected: string, provided: string) {
+  const [expectedHash, providedHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", new TextEncoder().encode(expected)),
+    crypto.subtle.digest("SHA-256", new TextEncoder().encode(provided)),
+  ]);
+  return timingSafeEqual(
+    new Uint8Array(expectedHash),
+    new Uint8Array(providedHash),
+  );
+}
+
+function getCookie(request: Request, name: string) {
+  const cookieHeader = request.headers.get("Cookie");
+  if (!cookieHeader) return null;
+  for (const entry of cookieHeader.split(";")) {
+    const separator = entry.indexOf("=");
+    if (separator === -1) continue;
+    const key = entry.slice(0, separator).trim();
+    if (key === name) return entry.slice(separator + 1).trim();
+  }
+  return null;
+}
+
+async function createSessionCookie(secret: string) {
+  const now = Math.floor(Date.now() / 1000);
+  const claims: SessionClaims = {
+    v: 1,
+    iat: now,
+    exp: now + SESSION_TTL_SECONDS,
+  };
+  const payload = bytesToBase64Url(
+    new TextEncoder().encode(JSON.stringify(claims)),
+  );
+  const signedValue = `v1.${payload}`;
+  const signature = bytesToBase64Url(await hmac(secret, signedValue));
+  return `${SESSION_COOKIE}=${signedValue}.${signature}; Path=/; Max-Age=${SESSION_TTL_SECONDS}; HttpOnly; Secure; SameSite=Strict`;
+}
+
+function clearSessionCookie() {
+  return `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict`;
+}
+
+async function readSession(request: Request, secret: string) {
+  const cookie = getCookie(request, SESSION_COOKIE);
+  if (!cookie) return null;
+  const parts = cookie.split(".");
+  if (parts.length !== 3 || parts[0] !== "v1") return null;
+
+  const payloadBytes = base64UrlToBytes(parts[1]);
+  const signature = base64UrlToBytes(parts[2]);
+  if (!payloadBytes || !signature) return null;
+
+  const expectedSignature = await hmac(secret, `v1.${parts[1]}`);
+  if (!timingSafeEqual(signature, expectedSignature)) return null;
+
+  try {
+    const claims = JSON.parse(
+      new TextDecoder().decode(payloadBytes),
+    ) as Partial<SessionClaims>;
+    const now = Math.floor(Date.now() / 1000);
+    if (
+      claims.v !== 1 ||
+      !Number.isInteger(claims.iat) ||
+      !Number.isInteger(claims.exp) ||
+      (claims.iat as number) > now + 60 ||
+      (claims.exp as number) <= now ||
+      (claims.exp as number) - (claims.iat as number) > SESSION_TTL_SECONDS
+    ) {
+      return null;
+    }
+    return claims as SessionClaims;
+  } catch {
+    return null;
+  }
+}
+
+function authConfigurationIssue(env: Env) {
+  if (!env.DB) return "관제 데이터베이스가 연결되지 않았습니다.";
+  if (!env.CONTROL_PASSWORD || env.CONTROL_PASSWORD.length < 8) {
+    return "CONTROL_PASSWORD 보안 비밀값을 8자 이상으로 설정해야 합니다.";
+  }
+  if (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32) {
+    return "SESSION_SECRET 보안 비밀값을 32자 이상으로 설정해야 합니다.";
+  }
+  return null;
+}
+
+function assertSameOrigin(request: Request) {
+  const url = new URL(request.url);
+  const origin = request.headers.get("Origin");
+  const fetchSite = request.headers.get("Sec-Fetch-Site");
+  if (origin && origin !== url.origin) {
+    throw new ApiError(
+      403,
+      "CROSS_ORIGIN_REQUEST",
+      "다른 사이트에서 보낸 요청은 허용되지 않습니다.",
+    );
+  }
+  if (fetchSite === "cross-site") {
+    throw new ApiError(
+      403,
+      "CROSS_ORIGIN_REQUEST",
+      "다른 사이트에서 보낸 요청은 허용되지 않습니다.",
+    );
+  }
+}
+
+async function requireSession(request: Request, env: Env) {
+  const issue = authConfigurationIssue(env);
+  if (issue || !env.SESSION_SECRET) {
+    throw new ApiError(503, "AUTH_NOT_CONFIGURED", issue ?? "로그인 설정 오류");
+  }
+  const claims = await readSession(request, env.SESSION_SECRET);
+  if (!claims) {
+    throw new ApiError(
+      401,
+      "AUTH_REQUIRED",
+      "관제센터 로그인이 필요합니다.",
+    );
+  }
+  return claims;
+}
+
+async function loginIdentity(request: Request, secret: string) {
+  const address = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  return bytesToBase64Url(await hmac(secret, `login-attempt:${address}`));
+}
+
+async function readLoginAttempt(db: D1Database, identity: string) {
+  return db
+    .prepare(
+      `SELECT attempts, window_started, blocked_until
+       FROM login_attempts
+       WHERE identity = ?1`,
+    )
+    .bind(identity)
+    .first<LoginAttemptRow>();
+}
+
+async function recordFailedLogin(
+  db: D1Database,
+  identity: string,
+  now: number,
+) {
+  const windowCutoff = now - LOGIN_WINDOW_MS;
+  await db
+    .prepare(
+      `INSERT INTO login_attempts (
+         identity, attempts, window_started, blocked_until, updated_at
+       ) VALUES (?1, 1, ?2, 0, ?2)
+       ON CONFLICT(identity) DO UPDATE SET
+         attempts = CASE
+           WHEN login_attempts.window_started < ?3 THEN 1
+           ELSE login_attempts.attempts + 1
+         END,
+         window_started = CASE
+           WHEN login_attempts.window_started < ?3 THEN ?2
+           ELSE login_attempts.window_started
+         END,
+         blocked_until = CASE
+           WHEN (
+             CASE
+               WHEN login_attempts.window_started < ?3 THEN 1
+               ELSE login_attempts.attempts + 1
+             END
+           ) >= ?4 THEN ?2 + ?5
+           ELSE 0
+         END,
+         updated_at = ?2`,
+    )
+    .bind(identity, now, windowCutoff, LOGIN_MAX_ATTEMPTS, LOGIN_BLOCK_MS)
+    .run();
+  return readLoginAttempt(db, identity);
+}
+
+async function handleSessionStatus(request: Request, env: Env) {
+  if (request.method !== "GET") return methodNotAllowed(["GET"]);
+  const issue = authConfigurationIssue(env);
+  if (issue || !env.SESSION_SECRET) {
+    return jsonResponse({ authenticated: false, configured: false });
+  }
+  const session = await readSession(request, env.SESSION_SECRET);
+  return jsonResponse({
+    authenticated: session !== null,
+    configured: true,
+    ...(session ? { expiresAt: new Date(session.exp * 1000).toISOString() } : {}),
+  });
+}
+
+async function handleLogin(request: Request, env: Env) {
+  if (request.method !== "POST") return methodNotAllowed(["POST"]);
+  assertSameOrigin(request);
+
+  const issue = authConfigurationIssue(env);
+  if (issue || !env.DB || !env.CONTROL_PASSWORD || !env.SESSION_SECRET) {
+    throw new ApiError(503, "AUTH_NOT_CONFIGURED", issue ?? "로그인 설정 오류");
+  }
+
+  const contentLength = Number(request.headers.get("Content-Length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > MAX_JSON_BODY_BYTES) {
+    throw new ApiError(
+      413,
+      "REQUEST_TOO_LARGE",
+      "로그인 요청의 크기가 너무 큽니다.",
+    );
+  }
+
+  const identity = await loginIdentity(request, env.SESSION_SECRET);
+  const now = Date.now();
+  let previousAttempt: LoginAttemptRow | null;
+  try {
+    previousAttempt = await readLoginAttempt(env.DB, identity);
+  } catch {
+    throw new ApiError(
+      503,
+      "DATABASE_NOT_READY",
+      "로그인 데이터베이스 준비가 필요합니다.",
+    );
+  }
+
+  if (previousAttempt && previousAttempt.blocked_until > now) {
+    const retryAfterSeconds = Math.max(
+      1,
+      Math.ceil((previousAttempt.blocked_until - now) / 1000),
+    );
+    throw new ApiError(
+      429,
+      "TOO_MANY_ATTEMPTS",
+      "로그인 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+      retryAfterSeconds,
+    );
+  }
+
+  let body: unknown;
+  try {
+    const text = await request.text();
+    if (utf8Length(text) > MAX_JSON_BODY_BYTES) {
+      throw new ApiError(
+        413,
+        "REQUEST_TOO_LARGE",
+        "로그인 요청의 크기가 너무 큽니다.",
+      );
+    }
+    body = JSON.parse(text);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(
+      400,
+      "INVALID_JSON",
+      "올바른 로그인 정보를 입력해 주세요.",
+    );
+  }
+  const password =
+    body && typeof body === "object" && "password" in body
+      ? (body as { password?: unknown }).password
+      : undefined;
+  if (typeof password !== "string" || password.length > 512) {
+    throw new ApiError(
+      400,
+      "INVALID_PASSWORD",
+      "올바른 관제 비밀번호를 입력해 주세요.",
+    );
+  }
+
+  const matches = await constantTimePasswordMatches(
+    env.CONTROL_PASSWORD,
+    password,
+  );
+  if (!matches) {
+    let attempt: LoginAttemptRow | null;
+    try {
+      attempt = await recordFailedLogin(env.DB, identity, now);
+    } catch {
+      throw new ApiError(
+        503,
+        "DATABASE_NOT_READY",
+        "로그인 데이터베이스 준비가 필요합니다.",
+      );
+    }
+    if (attempt && attempt.blocked_until > now) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((attempt.blocked_until - now) / 1000),
+      );
+      throw new ApiError(
+        429,
+        "TOO_MANY_ATTEMPTS",
+        "로그인 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+        retryAfterSeconds,
+      );
+    }
+    throw new ApiError(
+      401,
+      "INVALID_CREDENTIALS",
+      "관제 비밀번호가 올바르지 않습니다.",
+    );
+  }
+
+  await env.DB
+    .prepare("DELETE FROM login_attempts WHERE identity = ?1")
+    .bind(identity)
+    .run();
+  const sessionCookie = await createSessionCookie(env.SESSION_SECRET);
+  return jsonResponse(
+    { ok: true, authenticated: true },
+    200,
+    { "Set-Cookie": sessionCookie },
+  );
+}
+
+async function handleLogout(request: Request) {
+  if (request.method !== "POST") return methodNotAllowed(["POST"]);
+  assertSameOrigin(request);
+  return jsonResponse(
+    { ok: true },
+    200,
+    { "Set-Cookie": clearSessionCookie() },
+  );
+}
+
+function requireFiniteNumber(
+  value: unknown,
+  name: string,
+  min: number,
+  max: number,
+) {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value < min ||
+    value > max
+  ) {
+    throw new ApiError(
+      400,
+      "INVALID_EVENT_META",
+      `${name} 값이 올바르지 않습니다.`,
+    );
+  }
+  return value;
+}
+
+function optionalCount(value: unknown, name: string) {
+  if (value === undefined || value === null) return undefined;
+  const count = requireFiniteNumber(value, name, 0, 10_000);
+  if (!Number.isInteger(count)) {
+    throw new ApiError(
+      400,
+      "INVALID_EVENT_META",
+      `${name} 값이 올바르지 않습니다.`,
+    );
+  }
+  return count;
+}
+
+function requireText(
+  value: unknown,
+  name: string,
+  minimum: number,
+  maximum: number,
+) {
+  if (typeof value !== "string") {
+    throw new ApiError(
+      400,
+      "INVALID_EVENT_META",
+      `${name} 값이 올바르지 않습니다.`,
+    );
+  }
+  const text = value.trim();
+  if (
+    text.length < minimum ||
+    text.length > maximum ||
+    utf8Length(text) > maximum * 4
+  ) {
+    throw new ApiError(
+      400,
+      "INVALID_EVENT_META",
+      `${name} 길이가 올바르지 않습니다.`,
+    );
+  }
+  return text;
+}
+
+function parseEventMeta(value: unknown): EventMeta {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(
+      400,
+      "INVALID_EVENT_META",
+      "이벤트 정보가 올바르지 않습니다.",
+    );
+  }
+  const input = value as Record<string, unknown>;
+  if (
+    typeof input.status !== "string" ||
+    !EVENT_STATUSES.has(input.status as EventStatus)
+  ) {
+    throw new ApiError(
+      400,
+      "INVALID_EVENT_META",
+      "이벤트 상태가 올바르지 않습니다.",
+    );
+  }
+  if (
+    typeof input.notification !== "string" ||
+    !NOTIFICATION_STATUSES.has(input.notification as NotificationStatus)
+  ) {
+    throw new ApiError(
+      400,
+      "INVALID_EVENT_META",
+      "알림 상태가 올바르지 않습니다.",
+    );
+  }
+
+  const createdAtText = requireText(input.createdAt, "createdAt", 10, 40);
+  const createdAt = Date.parse(createdAtText);
+  const now = Date.now();
+  if (
+    !Number.isFinite(createdAt) ||
+    createdAt > now + 5 * 60 * 1000 ||
+    createdAt < now - 30 * 24 * 60 * 60 * 1000
+  ) {
+    throw new ApiError(
+      400,
+      "INVALID_EVENT_META",
+      "이벤트 발생시각이 허용 범위를 벗어났습니다.",
+    );
+  }
+
+  let id: string | undefined;
+  if (input.id !== undefined) {
+    if (typeof input.id !== "string" || !EVENT_ID_PATTERN.test(input.id)) {
+      throw new ApiError(
+        400,
+        "INVALID_EVENT_META",
+        "이벤트 ID가 올바르지 않습니다.",
+      );
+    }
+    id = input.id;
+  }
+
+  let deviceId: string | undefined;
+  if (input.deviceId !== undefined && input.deviceId !== null) {
+    deviceId = requireText(input.deviceId, "deviceId", 1, 80);
+  }
+
+  return {
+    ...(id ? { id } : {}),
+    status: input.status as EventStatus,
+    title: requireText(input.title, "title", 1, 120),
+    detail: requireText(input.detail, "detail", 0, 500),
+    createdAt: new Date(createdAt).toISOString(),
+    durationSeconds: requireFiniteNumber(
+      input.durationSeconds,
+      "durationSeconds",
+      0,
+      30,
+    ),
+    confidence: requireFiniteNumber(input.confidence, "confidence", 0, 1),
+    notification: input.notification as NotificationStatus,
+    people: optionalCount(input.people, "people"),
+    objects: optionalCount(input.objects, "objects"),
+    ...(deviceId ? { deviceId } : {}),
+  };
+}
+
+async function formMeta(form: FormData) {
+  const entry = form.get("meta");
+  let text: string;
+  if (typeof entry === "string") {
+    text = entry;
+  } else if (entry instanceof Blob) {
+    if (entry.size > MAX_META_BYTES) {
+      throw new ApiError(
+        413,
+        "EVENT_META_TOO_LARGE",
+        "이벤트 정보의 크기가 너무 큽니다.",
+      );
+    }
+    text = await entry.text();
+  } else {
+    throw new ApiError(
+      400,
+      "MISSING_EVENT_META",
+      "이벤트 정보가 누락되었습니다.",
+    );
+  }
+  if (utf8Length(text) > MAX_META_BYTES) {
+    throw new ApiError(
+      413,
+      "EVENT_META_TOO_LARGE",
+      "이벤트 정보의 크기가 너무 큽니다.",
+    );
+  }
+  try {
+    return parseEventMeta(JSON.parse(text));
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(
+      400,
+      "INVALID_EVENT_META",
+      "이벤트 JSON을 확인해 주세요.",
+    );
+  }
+}
+
+function formBlob(form: FormData, name: "clip" | "poster") {
+  const entry = form.get(name);
+  if (entry === null) return null;
+  if (!(entry instanceof Blob)) {
+    throw new ApiError(
+      400,
+      "INVALID_MEDIA",
+      `${name} 파일이 올바르지 않습니다.`,
+    );
+  }
+  return entry;
+}
+
+function validateFormEnvelope(form: FormData) {
+  const allowedNames = new Set(["meta", "clip", "poster"]);
+  let totalBytes = 0;
+  const counts = new Map<string, number>();
+  for (const [name, value] of form.entries()) {
+    if (!allowedNames.has(name)) {
+      throw new ApiError(
+        400,
+        "UNEXPECTED_FORM_FIELD",
+        "허용되지 않은 업로드 항목이 포함되어 있습니다.",
+      );
+    }
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+    totalBytes +=
+      typeof value === "string" ? utf8Length(value) : value.size;
+    if (totalBytes > MAX_MULTIPART_BYTES) {
+      throw new ApiError(
+        413,
+        "REQUEST_TOO_LARGE",
+        "이벤트 업로드의 크기가 너무 큽니다.",
+      );
+    }
+  }
+  if (
+    (counts.get("meta") ?? 0) !== 1 ||
+    (counts.get("clip") ?? 0) > 1 ||
+    (counts.get("poster") ?? 0) > 1
+  ) {
+    throw new ApiError(
+      400,
+      "DUPLICATE_FORM_FIELD",
+      "이벤트 업로드 항목이 중복되었습니다.",
+    );
+  }
+}
+
+async function hasExpectedMagic(blob: Blob, mime: string) {
+  const bytes = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
+  if (mime === "video/mp4") {
+    return (
+      bytes.length >= 12 &&
+      String.fromCharCode(...bytes.slice(4, 8)) === "ftyp"
+    );
+  }
+  if (mime === "video/webm") {
+    return (
+      bytes.length >= 4 &&
+      bytes[0] === 0x1a &&
+      bytes[1] === 0x45 &&
+      bytes[2] === 0xdf &&
+      bytes[3] === 0xa3
+    );
+  }
+  if (mime === "image/jpeg") {
+    return (
+      bytes.length >= 3 &&
+      bytes[0] === 0xff &&
+      bytes[1] === 0xd8 &&
+      bytes[2] === 0xff
+    );
+  }
+  if (mime === "image/webp") {
+    return (
+      bytes.length >= 12 &&
+      String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" &&
+      String.fromCharCode(...bytes.slice(8, 12)) === "WEBP"
+    );
+  }
+  return false;
+}
+
+async function validateMedia(
+  blob: Blob | null,
+  kind: "clip" | "poster",
+) {
+  if (!blob) return null;
+  const maxBytes = kind === "clip" ? MAX_CLIP_BYTES : MAX_POSTER_BYTES;
+  const allowed = kind === "clip" ? ALLOWED_CLIP_TYPES : ALLOWED_POSTER_TYPES;
+  const mime = normalizeMime(blob.type);
+  if (blob.size === 0 || blob.size > maxBytes) {
+    throw new ApiError(
+      blob.size > maxBytes ? 413 : 400,
+      "INVALID_MEDIA_SIZE",
+      kind === "clip"
+        ? "영상은 12MB 이하만 저장할 수 있습니다."
+        : "대표 이미지는 1MB 이하만 저장할 수 있습니다.",
+    );
+  }
+  if (!allowed.has(mime)) {
+    throw new ApiError(
+      415,
+      "UNSUPPORTED_MEDIA_TYPE",
+      kind === "clip"
+        ? "MP4 또는 WebM 영상만 저장할 수 있습니다."
+        : "JPEG 또는 WebP 이미지만 저장할 수 있습니다.",
+    );
+  }
+  if (!(await hasExpectedMagic(blob, mime))) {
+    throw new ApiError(
+      415,
+      "INVALID_MEDIA_CONTENT",
+      "파일 내용과 형식이 일치하지 않습니다.",
+    );
+  }
+  return { blob, mime, size: blob.size };
+}
+
+function extensionForMime(mime: string) {
+  switch (mime) {
+    case "video/mp4":
+      return "mp4";
+    case "video/webm":
+      return "webm";
+    case "image/jpeg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    default:
+      throw new ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "지원하지 않는 형식입니다.");
+  }
+}
+
+function eventResponse(row: EventRow) {
+  const clipUrl = row.clip_key ? `/api/events/${row.id}/clip` : null;
+  const posterUrl = row.poster_key ? `/api/events/${row.id}/poster` : null;
+  return {
+    id: row.id,
+    status: row.status,
+    title: row.title,
+    detail: row.detail,
+    createdAt: new Date(row.created_at).toISOString(),
+    durationSeconds: row.duration_seconds,
+    confidence: row.confidence,
+    notification: row.notification,
+    ...(row.people === null ? {} : { people: row.people }),
+    ...(row.objects === null ? {} : { objects: row.objects }),
+    ...(row.device_id === null ? {} : { deviceId: row.device_id }),
+    expiresAt: new Date(row.expires_at).toISOString(),
+    clipUrl,
+    posterUrl,
+    clipAvailable: clipUrl !== null,
+    posterAvailable: posterUrl !== null,
+    clipState: clipUrl ? "stored" : "none",
+    mimeType: row.clip_mime ?? "",
+    bytes: row.clip_size ?? 0,
+  };
+}
+
+const EVENT_COLUMNS = `
+  id, status, title, detail, created_at, duration_seconds, confidence,
+  notification, people, objects, device_id, clip_key, clip_mime, clip_size,
+  poster_key, poster_mime, poster_size, expires_at
+`;
+
+async function eventById(db: D1Database, id: string) {
+  return db
+    .prepare(`SELECT ${EVENT_COLUMNS} FROM safety_events WHERE id = ?1`)
+    .bind(id)
+    .first<EventRow>();
+}
+
+function eventMatchesUpload(
+  row: EventRow,
+  meta: EventMeta,
+  clip: { mime: string; size: number } | null,
+  poster: { mime: string; size: number } | null,
+) {
+  return (
+    row.status === meta.status &&
+    row.title === meta.title &&
+    row.detail === meta.detail &&
+    row.created_at === Date.parse(meta.createdAt) &&
+    row.duration_seconds === meta.durationSeconds &&
+    row.confidence === meta.confidence &&
+    row.notification === meta.notification &&
+    row.people === (meta.people ?? null) &&
+    row.objects === (meta.objects ?? null) &&
+    row.device_id === (meta.deviceId ?? null) &&
+    Boolean(row.clip_key) === Boolean(clip) &&
+    row.clip_mime === (clip?.mime ?? null) &&
+    row.clip_size === (clip?.size ?? null) &&
+    Boolean(row.poster_key) === Boolean(poster) &&
+    row.poster_mime === (poster?.mime ?? null) &&
+    row.poster_size === (poster?.size ?? null)
+  );
+}
+
+async function listEvents(request: Request, env: Env) {
+  if (!env.DB) {
+    throw new ApiError(
+      503,
+      "DATABASE_NOT_CONFIGURED",
+      "이벤트 데이터베이스가 연결되지 않았습니다.",
+    );
+  }
+  const url = new URL(request.url);
+  const requestedLimit = Number(url.searchParams.get("limit") ?? "50");
+  const limit = Number.isInteger(requestedLimit)
+    ? Math.min(100, Math.max(1, requestedLimit))
+    : 50;
+  let result: D1Result<EventRow>;
+  try {
+    result = await env.DB
+      .prepare(
+        `SELECT ${EVENT_COLUMNS}
+         FROM safety_events
+         WHERE expires_at > ?1
+         ORDER BY created_at DESC
+         LIMIT ?2`,
+      )
+      .bind(Date.now(), limit)
+      .all<EventRow>();
+  } catch {
+    throw new ApiError(
+      503,
+      "DATABASE_NOT_READY",
+      "이벤트 데이터베이스 준비가 필요합니다.",
+    );
+  }
+  return jsonResponse({ events: result.results.map(eventResponse) });
+}
+
+async function createEvent(request: Request, env: Env) {
+  if (!env.DB) {
+    throw new ApiError(
+      503,
+      "DATABASE_NOT_CONFIGURED",
+      "이벤트 데이터베이스가 연결되지 않았습니다.",
+    );
+  }
+  assertSameOrigin(request);
+
+  const contentType = request.headers.get("Content-Type") ?? "";
+  if (!contentType.toLowerCase().startsWith("multipart/form-data;")) {
+    throw new ApiError(
+      415,
+      "UNSUPPORTED_CONTENT_TYPE",
+      "multipart/form-data 형식으로 전송해 주세요.",
+    );
+  }
+  const contentLength = Number(request.headers.get("Content-Length") ?? "0");
+  if (
+    Number.isFinite(contentLength) &&
+    contentLength > MAX_MULTIPART_BYTES
+  ) {
+    throw new ApiError(
+      413,
+      "REQUEST_TOO_LARGE",
+      "이벤트 업로드의 크기가 너무 큽니다.",
+    );
+  }
+
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch {
+    throw new ApiError(
+      400,
+      "INVALID_FORM_DATA",
+      "이벤트 업로드 형식을 확인해 주세요.",
+    );
+  }
+  validateFormEnvelope(form);
+  const [meta, clip, poster] = await Promise.all([
+    formMeta(form),
+    validateMedia(formBlob(form, "clip"), "clip"),
+    validateMedia(formBlob(form, "poster"), "poster"),
+  ]);
+  if (
+    (clip?.size ?? 0) + (poster?.size ?? 0) + MAX_META_BYTES >
+    MAX_MULTIPART_BYTES
+  ) {
+    throw new ApiError(
+      413,
+      "REQUEST_TOO_LARGE",
+      "이벤트 업로드의 크기가 너무 큽니다.",
+    );
+  }
+  if ((clip || poster) && !env.EVENT_MEDIA) {
+    throw new ApiError(
+      503,
+      "MEDIA_STORAGE_NOT_CONFIGURED",
+      "비공개 영상 저장소가 연결되지 않았습니다.",
+    );
+  }
+
+  const id = meta.id ?? crypto.randomUUID();
+  const existing = await eventById(env.DB, id);
+  if (existing) {
+    if (eventMatchesUpload(existing, meta, clip, poster)) {
+      return jsonResponse(
+        { event: eventResponse(existing), idempotent: true },
+        200,
+      );
+    }
+    throw new ApiError(
+      409,
+      "EVENT_ALREADY_EXISTS",
+      "같은 ID에 다른 내용의 이벤트가 이미 저장되어 있습니다.",
+    );
+  }
+
+  const createdAt = Date.parse(meta.createdAt);
+  const expiresAt = Date.now() + EVENT_RETENTION_MS;
+  // A request-unique object prefix prevents a losing concurrent INSERT from
+  // deleting the media committed by the winning request with the same event ID.
+  const prefix = `events/${id}/${crypto.randomUUID()}`;
+  const clipKey = clip
+    ? `${prefix}/clip.${extensionForMime(clip.mime)}`
+    : null;
+  const posterKey = poster
+    ? `${prefix}/poster.${extensionForMime(poster.mime)}`
+    : null;
+  const uploadedKeys: string[] = [];
+
+  try {
+    if (clip && clipKey && env.EVENT_MEDIA) {
+      await env.EVENT_MEDIA.put(clipKey, clip.blob, {
+        httpMetadata: {
+          contentType: clip.mime,
+          cacheControl: "private, no-store",
+          contentDisposition: `inline; filename="${id}.${extensionForMime(clip.mime)}"`,
+        },
+        customMetadata: {
+          eventId: id,
+          expiresAt: new Date(expiresAt).toISOString(),
+          privacy: "face-blurred-no-audio",
+        },
+      });
+      uploadedKeys.push(clipKey);
+    }
+    if (poster && posterKey && env.EVENT_MEDIA) {
+      await env.EVENT_MEDIA.put(posterKey, poster.blob, {
+        httpMetadata: {
+          contentType: poster.mime,
+          cacheControl: "private, no-store",
+          contentDisposition: `inline; filename="${id}.${extensionForMime(poster.mime)}"`,
+        },
+        customMetadata: {
+          eventId: id,
+          expiresAt: new Date(expiresAt).toISOString(),
+          privacy: "face-blurred",
+        },
+      });
+      uploadedKeys.push(posterKey);
+    }
+
+    await env.DB
+      .prepare(
+        `INSERT INTO safety_events (
+           id, status, title, detail, created_at, duration_seconds, confidence,
+           notification, people, objects, device_id, clip_key, clip_mime,
+           clip_size, poster_key, poster_mime, poster_size, expires_at
+         ) VALUES (
+           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+           ?15, ?16, ?17, ?18
+         )`,
+      )
+      .bind(
+        id,
+        meta.status,
+        meta.title,
+        meta.detail,
+        createdAt,
+        meta.durationSeconds,
+        meta.confidence,
+        meta.notification,
+        meta.people ?? null,
+        meta.objects ?? null,
+        meta.deviceId ?? null,
+        clipKey,
+        clip?.mime ?? null,
+        clip?.size ?? null,
+        posterKey,
+        poster?.mime ?? null,
+        poster?.size ?? null,
+        expiresAt,
+      )
+      .run();
+  } catch {
+    if (uploadedKeys.length > 0 && env.EVENT_MEDIA) {
+      await env.EVENT_MEDIA.delete(uploadedKeys).catch(() => undefined);
+    }
+    const concurrentWinner = await eventById(env.DB, id).catch(() => null);
+    if (
+      concurrentWinner &&
+      eventMatchesUpload(concurrentWinner, meta, clip, poster)
+    ) {
+      return jsonResponse(
+        { event: eventResponse(concurrentWinner), idempotent: true },
+        200,
+      );
+    }
+    throw new ApiError(
+      503,
+      "EVENT_SAVE_FAILED",
+      "이벤트를 안전하게 저장하지 못했습니다.",
+    );
+  }
+
+  const saved = await eventById(env.DB, id);
+  if (!saved) {
+    throw new ApiError(
+      503,
+      "EVENT_SAVE_FAILED",
+      "저장된 이벤트를 확인하지 못했습니다.",
+    );
+  }
+  return jsonResponse({ event: eventResponse(saved) }, 201);
+}
+
+function parseRange(value: string, size: number) {
+  if (!value.startsWith("bytes=") || value.includes(",")) return null;
+  const match = /^bytes=(\d*)-(\d*)$/u.exec(value);
+  if (!match || (!match[1] && !match[2])) return null;
+
+  if (!match[1]) {
+    const suffix = Number(match[2]);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return null;
+    const length = Math.min(size, suffix);
+    return { offset: size - length, length };
+  }
+
+  const start = Number(match[1]);
+  if (!Number.isSafeInteger(start) || start < 0 || start >= size) return null;
+  const requestedEnd = match[2] ? Number(match[2]) : size - 1;
+  if (!Number.isSafeInteger(requestedEnd) || requestedEnd < start) return null;
+  const end = Math.min(size - 1, requestedEnd);
+  return { offset: start, length: end - start + 1 };
+}
+
+async function serveEventMedia(
+  request: Request,
+  env: Env,
+  id: string,
+  kind: "clip" | "poster",
+) {
+  if (!EVENT_ID_PATTERN.test(id)) {
+    throw new ApiError(404, "EVENT_NOT_FOUND", "이벤트를 찾을 수 없습니다.");
+  }
+  if (!env.DB || !env.EVENT_MEDIA) {
+    throw new ApiError(
+      503,
+      "MEDIA_STORAGE_NOT_CONFIGURED",
+      "비공개 영상 저장소가 연결되지 않았습니다.",
+    );
+  }
+  const event = await eventById(env.DB, id);
+  if (!event || event.expires_at <= Date.now()) {
+    throw new ApiError(404, "EVENT_NOT_FOUND", "이벤트를 찾을 수 없습니다.");
+  }
+  const key = kind === "clip" ? event.clip_key : event.poster_key;
+  const mime = kind === "clip" ? event.clip_mime : event.poster_mime;
+  if (!key || !mime) {
+    throw new ApiError(
+      404,
+      "MEDIA_NOT_FOUND",
+      kind === "clip"
+        ? "저장된 10초 영상이 없습니다."
+        : "저장된 대표 이미지가 없습니다.",
+    );
+  }
+
+  const objectHead = await env.EVENT_MEDIA.head(key);
+  if (!objectHead) {
+    throw new ApiError(404, "MEDIA_NOT_FOUND", "저장된 파일이 없습니다.");
+  }
+  const headers = new Headers();
+  objectHead.writeHttpMetadata(headers);
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Cache-Control", "private, no-store");
+  headers.set("Content-Type", mime);
+  headers.set("ETag", objectHead.httpEtag);
+  headers.set("Last-Modified", objectHead.uploaded.toUTCString());
+  headers.set("Referrer-Policy", "no-referrer");
+  headers.set("X-Content-Type-Options", "nosniff");
+
+  const rangeHeader = request.headers.get("Range");
+  if (rangeHeader) {
+    const range = parseRange(rangeHeader, objectHead.size);
+    if (!range) {
+      headers.set("Content-Range", `bytes */${objectHead.size}`);
+      return new Response(null, { status: 416, headers });
+    }
+    headers.set(
+      "Content-Range",
+      `bytes ${range.offset}-${range.offset + range.length - 1}/${objectHead.size}`,
+    );
+    headers.set("Content-Length", String(range.length));
+    if (request.method === "HEAD") {
+      return new Response(null, { status: 206, headers });
+    }
+    const object = await env.EVENT_MEDIA.get(key, { range });
+    if (!object) {
+      throw new ApiError(404, "MEDIA_NOT_FOUND", "저장된 파일이 없습니다.");
+    }
+    return new Response(object.body, { status: 206, headers });
+  }
+
+  headers.set("Content-Length", String(objectHead.size));
+  if (request.method === "HEAD") {
+    return new Response(null, { status: 200, headers });
+  }
+  const object = await env.EVENT_MEDIA.get(key);
+  if (!object) {
+    throw new ApiError(404, "MEDIA_NOT_FOUND", "저장된 파일이 없습니다.");
+  }
+  return new Response(object.body, { status: 200, headers });
+}
+
+async function deleteEvent(env: Env, id: string) {
+  if (!EVENT_ID_PATTERN.test(id)) {
+    throw new ApiError(404, "EVENT_NOT_FOUND", "이벤트를 찾을 수 없습니다.");
+  }
+  if (!env.DB) {
+    throw new ApiError(
+      503,
+      "DATABASE_NOT_CONFIGURED",
+      "이벤트 데이터베이스가 연결되지 않았습니다.",
+    );
+  }
+  const event = await eventById(env.DB, id);
+  if (!event) {
+    throw new ApiError(404, "EVENT_NOT_FOUND", "이벤트를 찾을 수 없습니다.");
+  }
+  const keys = [event.clip_key, event.poster_key].filter(
+    (key): key is string => Boolean(key),
+  );
+  if (keys.length > 0) {
+    if (!env.EVENT_MEDIA) {
+      throw new ApiError(
+        503,
+        "MEDIA_STORAGE_NOT_CONFIGURED",
+        "비공개 영상 저장소가 연결되지 않았습니다.",
+      );
+    }
+    try {
+      await env.EVENT_MEDIA.delete(keys);
+    } catch {
+      throw new ApiError(
+        503,
+        "EVENT_DELETE_FAILED",
+        "저장 영상을 삭제하지 못했습니다.",
+      );
+    }
+  }
+  await env.DB
+    .prepare("DELETE FROM safety_events WHERE id = ?1")
+    .bind(id)
+    .run();
+  return jsonResponse({ ok: true });
+}
+
+async function cleanupExpiredEvents(env: Env) {
+  const db = env.DB;
+  const media = env.EVENT_MEDIA;
+  if (!db || !media) return;
+  const now = Date.now();
+  for (let batch = 0; batch < MAX_CLEANUP_BATCHES; batch += 1) {
+    const expired = await db
+      .prepare(
+        `SELECT id, clip_key, poster_key
+         FROM safety_events
+         WHERE expires_at <= ?1
+         ORDER BY expires_at ASC
+         LIMIT ?2`,
+      )
+      .bind(now, CLEANUP_BATCH_SIZE)
+      .all<ExpiredEventRow>();
+    if (expired.results.length === 0) break;
+
+    const keys = expired.results.flatMap((event) =>
+      [event.clip_key, event.poster_key].filter(
+        (key): key is string => Boolean(key),
+      ),
+    );
+    if (keys.length > 0) await media.delete(keys);
+    await db.batch(
+      expired.results.map((event) =>
+        db.prepare("DELETE FROM safety_events WHERE id = ?1").bind(event.id),
+      ),
+    );
+    if (expired.results.length < CLEANUP_BATCH_SIZE) break;
+  }
+  await db
+    .prepare("DELETE FROM login_attempts WHERE updated_at < ?1")
+    .bind(now - 24 * 60 * 60 * 1000)
+    .run();
+}
+
+async function handleEventsCollection(request: Request, env: Env) {
+  await requireSession(request, env);
+  if (request.method === "GET") return listEvents(request, env);
+  if (request.method === "POST") return createEvent(request, env);
+  return methodNotAllowed(["GET", "POST"]);
+}
+
+async function handleEventResource(
+  request: Request,
+  env: Env,
+  id: string,
+  resource?: "clip" | "poster",
+) {
+  await requireSession(request, env);
+  if (resource) {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return methodNotAllowed(["GET", "HEAD"]);
+    }
+    return serveEventMedia(request, env, id, resource);
+  }
+  if (request.method === "DELETE") {
+    assertSameOrigin(request);
+    return deleteEvent(env, id);
+  }
+  return methodNotAllowed(["DELETE"]);
+}
+
+async function handleApi(
+  request: Request,
+  env: Env,
+  ctx: WorkerExecutionContext,
+) {
+  const url = new URL(request.url);
+  try {
+    if (url.pathname === "/api/auth/session") {
+      return await handleSessionStatus(request, env);
+    }
+    if (url.pathname === "/api/auth/login") {
+      return await handleLogin(request, env);
+    }
+    if (url.pathname === "/api/auth/logout") {
+      return await handleLogout(request);
+    }
+    if (url.pathname === "/api/events") {
+      ctx.waitUntil(cleanupExpiredEvents(env).catch(() => undefined));
+      return await handleEventsCollection(request, env);
+    }
+    const eventRoute =
+      /^\/api\/events\/([A-Za-z0-9_-]+)(?:\/(clip|poster))?$/u.exec(
+        url.pathname,
+      );
+    if (eventRoute) {
+      ctx.waitUntil(cleanupExpiredEvents(env).catch(() => undefined));
+      return await handleEventResource(
+        request,
+        env,
+        eventRoute[1],
+        eventRoute[2] as "clip" | "poster" | undefined,
+      );
+    }
+    throw new ApiError(404, "API_NOT_FOUND", "API 경로를 찾을 수 없습니다.");
+  } catch (error) {
+    if (error instanceof ApiError) return errorResponse(error);
+    console.error("SAFEBOT API error", error);
+    return errorResponse(
+      new ApiError(
+        500,
+        "INTERNAL_ERROR",
+        "요청을 처리하는 중 오류가 발생했습니다.",
+      ),
+    );
+  }
+}
 
 const worker = {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: WorkerExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/_vinext/image") {
+    if (url.pathname.startsWith("/api/")) {
+      return handleApi(request, env, ctx);
+    }
+
+    if (url.pathname === "/_vinext/image" && env.IMAGES && env.ASSETS) {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
-      return handleImageOptimization(request, {
-        fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))),
-        transformImage: async (body, { width, format, quality }) => {
-          const result = await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality });
-          return result.response();
+      return handleImageOptimization(
+        request,
+        {
+          fetchAsset: (path) =>
+            env.ASSETS.fetch(new Request(new URL(path, request.url))),
+          transformImage: async (body, { width, format, quality }) => {
+            const result = await env.IMAGES!.input(body)
+              .transform(width > 0 ? { width } : {})
+              .output({ format, quality });
+            return result.response();
+          },
         },
-      }, allowedWidths);
+        allowedWidths,
+      );
     }
 
     return handler.fetch(request, env, ctx);
+  },
+
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    ctx: WorkerExecutionContext,
+  ) {
+    ctx.waitUntil(
+      cleanupExpiredEvents(env).catch((error) => {
+        console.error("SAFEBOT scheduled cleanup failed", error);
+      }),
+    );
   },
 };
 

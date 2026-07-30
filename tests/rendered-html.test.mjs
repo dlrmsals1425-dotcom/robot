@@ -4,13 +4,13 @@ import test from "node:test";
 
 const templateRoot = new URL("../", import.meta.url);
 
-async function render() {
+async function render(pathname = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request("https://safebot.example/", {
+    new Request(`https://safebot.example${pathname}`, {
       headers: {
         accept: "text/html",
         host: "safebot.example",
@@ -36,12 +36,25 @@ test("server-renders the SAFEBOT mobile patrol product", async () => {
 
   const html = await response.text();
   assert.match(html, /<html lang="ko">/i);
-  assert.match(html, /<title>SAFEBOT \| 주민안전 AI 순찰<\/title>/i);
+  assert.match(
+    html,
+    /<title>SAFEBOT \| 주민안전 AI 순찰(?:·관제)?<\/title>/i,
+  );
   assert.match(html, /SAFEBOT/);
   assert.match(html, /카메라 순찰 시작/);
   assert.match(html, /10초 알림 흐름 테스트/);
   assert.match(html, /얼굴 익명화/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/);
+});
+
+test("server-renders the protected SAFEBOT control-center entry", async () => {
+  const response = await render("/control");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /SAFEBOT 관제센터 \| 주민안전 AI 순찰/);
+  assert.match(html, /보안 연결을 확인하고 있습니다/);
+  assert.match(html, /관제 영상과 이벤트 이력은 인증된 담당자에게만 표시/);
+  assert.match(html, /현장기기/);
 });
 
 test("ships the PWA shell and pinned local AI assets", async () => {
@@ -75,7 +88,9 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   assert.match(serviceWorker, /notificationclick/);
   assert.match(serviceWorker, /showNotification/);
   assert.match(serviceWorker, /event\.request\.mode === "navigate"/);
-  assert.match(serviceWorker, /safebot-shell-v3/);
+  assert.match(serviceWorker, /safebot-shell-v4/);
+  assert.match(serviceWorker, /requestUrl\.pathname\.startsWith\("\/api\/"\)/);
+  assert.match(serviceWorker, /requestUrl\.pathname === "\/control"/);
   assert.match(page, /FaceDetector|blaze_face_full_range|얼굴/);
   assert.match(
     visionWorker,
@@ -113,4 +128,37 @@ test("keeps safety alerts compact and person overlays red", async () => {
   assert.match(fallDetection, /angleFromHorizontal < 30/);
   assert.match(fallDetection, /completeLeg/);
   assert.match(fallDetection, /FALL_NEGATIVE_BUDGET_MS/);
+});
+
+test("ships anonymized clip recording, bounded local storage, and private event APIs", async () => {
+  const [page, recorder, clipStore, worker, wrangler, packageJson] =
+    await Promise.all([
+      readFile(new URL("app/page.tsx", templateRoot), "utf8"),
+      readFile(new URL("app/event-recorder.ts", templateRoot), "utf8"),
+      readFile(new URL("app/clip-store.ts", templateRoot), "utf8"),
+      readFile(new URL("worker/index.ts", templateRoot), "utf8"),
+      readFile(new URL("wrangler.jsonc", templateRoot), "utf8"),
+      readFile(new URL("package.json", templateRoot), "utf8"),
+    ]);
+
+  assert.match(page, /recordingCanvasRef/);
+  assert.match(page, /startEventRecording/);
+  assert.match(page, /original camera MediaStream is never recorded/);
+  assert.match(page, /drawFullyPixelatedFrame/);
+  assert.match(page, /eventUploadPromisesRef/);
+  assert.doesNotMatch(page, /globalAlpha\s*=\s*0\.72/);
+  assert.match(recorder, /EVENT_RECORDING_MAX_DURATION_MS = 10_000/);
+  assert.match(recorder, /video\/mp4;codecs=avc1/);
+  assert.match(clipStore, /MAX_LOCAL_EVENT_CLIPS = 5/);
+  assert.match(clipStore, /MAX_LOCAL_EVENT_CLIP_BYTES = 50 \* 1024 \* 1024/);
+  assert.match(worker, /CONTROL_PASSWORD/);
+  assert.match(worker, /SESSION_SECRET/);
+  assert.match(worker, /EVENT_MEDIA/);
+  assert.match(worker, /pathname === "\/api\/events"/);
+  assert.match(worker, /eventMatchesUpload/);
+  assert.match(worker, /idempotent: true/);
+  assert.match(worker, /MAX_CLEANUP_BATCHES/);
+  assert.match(wrangler, /"crons": \["17 \* \* \* \*"\]/);
+  assert.match(wrangler, /"migrations_dir": "migrations"/);
+  assert.match(packageJson, /"migrate:cloudflare"/);
 });

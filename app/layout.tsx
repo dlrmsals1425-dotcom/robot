@@ -30,9 +30,9 @@ export async function generateMetadata(): Promise<Metadata> {
   const origin = `${protocol}://${host}`;
 
   return {
-    title: "SAFEBOT | 주민안전 AI 순찰",
+    title: "SAFEBOT | 주민안전 AI 순찰·관제",
     description:
-      "휴대폰 카메라로 사람과 사물을 감지하고, 누운 자세를 10초간 확인하는 개인정보 보호형 모바일 순찰 MVP",
+      "현장 카메라로 사람과 사물을 감지하고, 익명화된 10초 사건 영상을 관제센터에 전달하는 주민안전 AI MVP",
     applicationName: "SAFEBOT",
     manifest: "/manifest.webmanifest",
     formatDetection: {
@@ -56,26 +56,26 @@ export async function generateMetadata(): Promise<Metadata> {
     openGraph: {
       type: "website",
       url: origin,
-      title: "SAFEBOT | 주민안전 AI 순찰",
+      title: "SAFEBOT | 주민안전 AI 순찰·관제",
       description:
-        "기기 안에서 감지하고 얼굴을 익명화하는 모바일 순찰 안전 MVP",
+        "현장 순찰 로봇과 비공개 사건 영상을 연결하는 개인정보 보호형 안전 관제 MVP",
       siteName: "SAFEBOT",
       locale: "ko_KR",
       images: [
         {
-          url: new URL("/og.png", origin),
+          url: new URL("/og-control-center.png", origin),
           width: 1200,
           height: 630,
-          alt: "SAFEBOT 주민안전 AI 순찰 모바일 화면",
+          alt: "주민 공간을 순찰하는 SAFEBOT과 영상을 확인하는 관제센터",
         },
       ],
     },
     twitter: {
       card: "summary_large_image",
-      title: "SAFEBOT | 주민안전 AI 순찰",
+      title: "SAFEBOT | 주민안전 AI 순찰·관제",
       description:
-        "휴대폰 카메라로 시작하는 개인정보 보호형 Physical AI 안전 실증",
-      images: [new URL("/og.png", origin)],
+        "현장 단말의 익명화 사건 영상을 확인하는 Physical AI 안전 관제 실증",
+      images: [new URL("/og-control-center.png", origin)],
     },
   };
 }

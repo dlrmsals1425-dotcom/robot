@@ -16,7 +16,10 @@ import {
   FileClock,
   History,
   Info,
+  KeyRound,
+  LockKeyhole,
   MapPin,
+  MonitorUp,
   OctagonAlert,
   Pause,
   Play,
@@ -28,12 +31,35 @@ import {
   Smartphone,
   Sparkles,
   TriangleAlert,
+  UploadCloud,
   UserRound,
+  Video,
   Wifi,
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  deleteEventClip,
+  getEventClip,
+  listEventClips,
+  saveEventClip,
+  updateEventClipUploadStatus,
+} from "./clip-store";
+import {
+  EventRecordingError,
+  startEventRecording,
+  type EventRecordingResult,
+  type EventRecordingSession,
+} from "./event-recorder";
 import {
   analyzeFallPose,
   createVerificationProgress,
@@ -55,6 +81,19 @@ type EventStatus =
   | "recovered"
   | "false_positive"
   | "interrupted";
+type ClipState =
+  | "none"
+  | "recording"
+  | "local"
+  | "uploading"
+  | "uploaded"
+  | "failed"
+  | "unsupported";
+type ControlConnectionState =
+  | "checking"
+  | "connected"
+  | "disconnected"
+  | "unavailable";
 
 type DetectionBox = {
   originX: number;
@@ -91,7 +130,14 @@ type SafetyEvent = {
   durationSeconds: number;
   confidence: number;
   notification: "sent" | "not_sent" | "permission_needed";
+  people?: number;
+  objects?: number;
   snapshot?: string;
+  clipState?: ClipState;
+  clipMimeType?: string;
+  clipBytes?: number;
+  clipDurationMs?: number;
+  serverEventId?: string;
 };
 
 type BeforeInstallPromptEvent = Event & {
@@ -114,7 +160,9 @@ const RECOVERY_CANDIDATE_DISTANCE = 0.28;
 const RECOVERY_STABILITY_MS = 850;
 const LOST_TRACKING_MS = 1_100;
 const MAX_VERIFICATION_WALL_MS = 20_000;
+const PRIVACY_RESULT_MAX_AGE_MS = 650;
 const STORAGE_KEY = "safebot-safety-events-v1";
+const DEVICE_ID_KEY = "safebot-device-id-v1";
 const PERSON_DETECTION_COLOR = "#ff4d5a";
 const OBJECT_DETECTION_COLOR = "#7bd4ff";
 
@@ -169,6 +217,21 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function formatClipBytes(bytes?: number) {
+  if (!bytes) return "";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+async function dataUrlToBlob(dataUrl?: string) {
+  if (!dataUrl) return undefined;
+  try {
+    return await (await fetch(dataUrl)).blob();
+  } catch {
+    return undefined;
+  }
+}
+
 function eventStatusLabel(status: EventStatus) {
   switch (status) {
     case "emergency":
@@ -221,10 +284,23 @@ export default function Home() {
     useState<BeforeInstallPromptEvent | null>(null);
   const [isStandalone, setIsStandalone] = useState(false);
   const [manualScenario, setManualScenario] = useState(false);
+  const [recordingState, setRecordingState] =
+    useState<ClipState>("none");
+  const [controlConnection, setControlConnection] =
+    useState<ControlConnectionState>("checking");
+  const [showControlLogin, setShowControlLogin] = useState(false);
+  const [controlPassword, setControlPassword] = useState("");
+  const [controlLoginError, setControlLoginError] = useState("");
+  const [controlLoginBusy, setControlLoginBusy] = useState(false);
+  const [selectedClip, setSelectedClip] = useState<{
+    event: SafetyEvent;
+    url: string;
+  } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const analysisCanvasRef = useRef<HTMLCanvasElement>(null);
+  const recordingCanvasRef = useRef<HTMLCanvasElement>(null);
   const alertPopupRef = useRef<HTMLDivElement>(null);
   const pixelCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -232,6 +308,12 @@ export default function Home() {
   const workerReadyRef = useRef<Promise<void> | null>(null);
   const workerBusyRef = useRef(false);
   const latestResultRef = useRef<VisionResult | null>(null);
+  const visionStatsRef = useRef<VisionStats>({
+    people: 0,
+    objects: 0,
+    confidence: 0,
+    latencyMs: 0,
+  });
   const animationRef = useRef<number | null>(null);
   const inferenceRef = useRef<number | null>(null);
   const alertPhaseRef = useRef<AlertPhase>("idle");
@@ -248,7 +330,13 @@ export default function Home() {
   const verificationCandidateRef = useRef<PoseCenter | null>(null);
   const emergencyTriggeredRef = useRef(false);
   const manualScenarioRef = useRef(false);
+  const recordingSessionRef = useRef<EventRecordingSession | null>(null);
+  const eventUploadPromisesRef = useRef(
+    new Map<string, Promise<boolean>>(),
+  );
+  const syncingClipsRef = useRef(false);
   const eventsRef = useRef<SafetyEvent[]>([]);
+  const deviceIdRef = useRef("모바일 순찰 01");
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleVisionResultRef = useRef<(result: VisionResult) => void>(() => {});
 
@@ -304,6 +392,10 @@ export default function Home() {
       durationSeconds: number,
       confidence: number,
       notification: SafetyEvent["notification"],
+      clip?: Pick<
+        SafetyEvent,
+        "clipState" | "clipMimeType" | "clipBytes" | "clipDurationMs"
+      >,
     ) => {
       const snapshot = captureSnapshot();
       const event: SafetyEvent = {
@@ -315,12 +407,26 @@ export default function Home() {
         durationSeconds,
         confidence,
         notification,
+        people: visionStatsRef.current.people,
+        objects: visionStatsRef.current.objects,
         snapshot,
+        ...clip,
       };
       persistEvents([event, ...eventsRef.current].slice(0, 16));
       return event;
     },
     [captureSnapshot, persistEvents],
+  );
+
+  const patchEvent = useCallback(
+    (eventId: string, patch: Partial<SafetyEvent>) => {
+      persistEvents(
+        eventsRef.current.map((event) =>
+          event.id === eventId ? { ...event, ...patch } : event,
+        ),
+      );
+    },
+    [persistEvents],
   );
 
   const sendDeviceNotification = useCallback(async () => {
@@ -353,6 +459,215 @@ export default function Home() {
       return false;
     }
   }, []);
+
+  const startVerificationRecording = useCallback(() => {
+    const source = canvasRef.current;
+    const target = recordingCanvasRef.current;
+    if (
+      !source ||
+      !target ||
+      source.width <= 0 ||
+      source.height <= 0 ||
+      !streamRef.current
+    ) {
+      setRecordingState("unsupported");
+      return;
+    }
+
+    void recordingSessionRef.current?.discard();
+    recordingSessionRef.current = null;
+
+    const scale = Math.min(1, 640 / source.width);
+    target.width = Math.max(1, Math.round(source.width * scale));
+    target.height = Math.max(1, Math.round(source.height * scale));
+    const context = target.getContext("2d", { alpha: false });
+    if (!context) {
+      setRecordingState("unsupported");
+      return;
+    }
+    // Start from an opaque safe frame. The render loop replaces this only
+    // with a verified redacted frame or full-frame pixelation.
+    context.fillStyle = "#07150f";
+    context.fillRect(0, 0, target.width, target.height);
+
+    try {
+      recordingSessionRef.current = startEventRecording(target, {
+        frameRate: 12,
+        maxDurationMs: FALL_CONFIRMATION_MS,
+        videoBitsPerSecond: 1_000_000,
+        timesliceMs: 1_000,
+      });
+      setRecordingState("recording");
+    } catch (error) {
+      setRecordingState(
+        error instanceof EventRecordingError &&
+          error.code === "UNSUPPORTED"
+          ? "unsupported"
+          : "failed",
+      );
+    }
+  }, []);
+
+  const discardVerificationRecording = useCallback(() => {
+    const session = recordingSessionRef.current;
+    recordingSessionRef.current = null;
+    setRecordingState("none");
+    if (session) void session.discard();
+  }, []);
+
+  const finalizeVerificationRecording =
+    useCallback(async (): Promise<EventRecordingResult | null> => {
+      const session = recordingSessionRef.current;
+      recordingSessionRef.current = null;
+      if (!session) return null;
+
+      try {
+        const result = await session.finalize();
+        setRecordingState("local");
+        return result;
+      } catch {
+        setRecordingState("failed");
+        return null;
+      }
+    }, []);
+
+  const uploadEventToControl = useCallback(
+    (event: SafetyEvent, clip: Blob) => {
+      const existingUpload = eventUploadPromisesRef.current.get(event.id);
+      if (existingUpload) return existingUpload;
+
+      const upload = (async () => {
+        patchEvent(event.id, { clipState: "uploading" });
+        setRecordingState("uploading");
+        await updateEventClipUploadStatus(event.id, "uploading");
+
+        try {
+          const form = new FormData();
+          form.set(
+            "meta",
+            JSON.stringify({
+              id: event.id,
+              status: event.status,
+              title: event.title,
+              detail: event.detail,
+              createdAt: event.createdAt,
+              durationSeconds: event.durationSeconds,
+              confidence: event.confidence,
+              notification: event.notification,
+              people: event.people,
+              objects: event.objects,
+              deviceId: deviceIdRef.current,
+            }),
+          );
+          const extension = clip.type.includes("mp4") ? "mp4" : "webm";
+          form.set("clip", clip, `${event.id}.${extension}`);
+          const poster = await dataUrlToBlob(event.snapshot);
+          if (poster) form.set("poster", poster, `${event.id}.jpg`);
+
+          const response = await fetch("/api/events", {
+            method: "POST",
+            credentials: "same-origin",
+            body: form,
+          });
+          if (response.status === 401) {
+            setControlConnection("disconnected");
+            throw new Error("관제 인증이 만료되었습니다.");
+          }
+          if (!response.ok) {
+            throw new Error("관제 서버 업로드에 실패했습니다.");
+          }
+
+          const payload = (await response.json()) as {
+            event?: { id?: string };
+          };
+          await updateEventClipUploadStatus(event.id, "uploaded");
+          patchEvent(event.id, {
+            clipState: "uploaded",
+            serverEventId: payload.event?.id || event.id,
+          });
+          setRecordingState("uploaded");
+          return true;
+        } catch {
+          await updateEventClipUploadStatus(event.id, "failed");
+          patchEvent(event.id, { clipState: "failed" });
+          setRecordingState("failed");
+          return false;
+        }
+      })();
+
+      eventUploadPromisesRef.current.set(event.id, upload);
+      void upload.finally(() => {
+        if (eventUploadPromisesRef.current.get(event.id) === upload) {
+          eventUploadPromisesRef.current.delete(event.id);
+        }
+      });
+      return upload;
+    },
+    [patchEvent],
+  );
+
+  const storeConfirmedClip = useCallback(
+    async (event: SafetyEvent, recording: EventRecordingResult) => {
+      const saved = await saveEventClip({
+        eventId: event.id,
+        blob: recording.blob,
+        durationMs: recording.durationMs,
+        createdAt: new Date(event.createdAt).getTime(),
+        uploadStatus:
+          controlConnection === "connected" ? "pending" : "local-only",
+      });
+      if (!saved.ok) {
+        patchEvent(event.id, { clipState: "failed" });
+        setRecordingState("failed");
+        return false;
+      }
+
+      for (const evictedId of saved.value.evictedEventIds) {
+        patchEvent(evictedId, {
+          clipState: "none",
+          clipBytes: undefined,
+          clipDurationMs: undefined,
+        });
+      }
+      patchEvent(event.id, {
+        clipState: "local",
+        clipMimeType: recording.mimeType,
+        clipBytes: recording.bytes,
+        clipDurationMs: recording.durationMs,
+      });
+
+      if (controlConnection === "connected") {
+        return uploadEventToControl(
+          { ...event, clipState: "local" },
+          recording.blob,
+        );
+      }
+      setRecordingState("local");
+      return true;
+    },
+    [controlConnection, patchEvent, uploadEventToControl],
+  );
+
+  const syncPendingClips = useCallback(async () => {
+    if (syncingClipsRef.current) return;
+    syncingClipsRef.current = true;
+    try {
+      const listed = await listEventClips();
+      if (!listed.ok) return;
+      for (const metadata of listed.value) {
+        if (metadata.uploadStatus === "uploaded") continue;
+        const event = eventsRef.current.find(
+          (candidate) => candidate.id === metadata.eventId,
+        );
+        if (!event || event.status !== "emergency") continue;
+        const stored = await getEventClip(event.id);
+        if (!stored.ok || !stored.value) continue;
+        await uploadEventToControl(event, stored.value.blob);
+      }
+    } finally {
+      syncingClipsRef.current = false;
+    }
+  }, [uploadEventToControl]);
 
   const resetDetectionState = useCallback(() => {
     verificationStartedRef.current = null;
@@ -391,14 +706,19 @@ export default function Home() {
     setPhase("alerted");
     setCountdown(0);
 
-    const notificationSent = await sendDeviceNotification();
+    const [notificationSent, recording] = await Promise.all([
+      sendDeviceNotification(),
+      finalizeVerificationRecording(),
+    ]);
     const permission =
       "Notification" in window ? Notification.permission : "denied";
 
-    addEvent(
+    const event = addEvent(
       "emergency",
       "쓰러짐 의심 · 관제 확인 필요",
-      "누운 자세가 10초간 연속 감지되어 기기 알림을 생성했습니다.",
+      recording
+        ? "누운 자세가 10초간 연속 감지되어 익명화된 무음 영상과 안전 알림을 기록했습니다."
+        : "누운 자세가 10초간 연속 감지되어 안전 알림을 기록했습니다. 이 기기에서는 영상 녹화를 완료하지 못했습니다.",
       duration,
       fallConfidence || 0.82,
       notificationSent
@@ -406,18 +726,38 @@ export default function Home() {
         : permission === "granted"
           ? "not_sent"
           : "permission_needed",
+      recording
+        ? {
+            clipState: "local",
+            clipMimeType: recording.mimeType,
+            clipBytes: recording.bytes,
+            clipDurationMs: recording.durationMs,
+          }
+        : {
+            clipState:
+              recordingState === "unsupported" ? "unsupported" : "failed",
+          },
     );
+    if (recording) void storeConfirmedClip(event, recording);
     showToast(
-      notificationSent
-        ? "기기 알림을 발송했습니다."
-        : "이벤트를 기록했습니다. 알림 권한을 확인해 주세요.",
+      recording
+        ? controlConnection === "connected"
+          ? "10초 영상을 저장하고 관제센터로 전송합니다."
+          : "10초 영상을 이 기기에 저장했습니다."
+        : notificationSent
+          ? "기기 알림을 발송했습니다."
+          : "이벤트를 기록했습니다. 알림 권한을 확인해 주세요.",
     );
   }, [
     addEvent,
+    controlConnection,
     fallConfidence,
+    finalizeVerificationRecording,
+    recordingState,
     sendDeviceNotification,
     setPhase,
     showToast,
+    storeConfirmedClip,
   ]);
 
   const beginVerification = useCallback(
@@ -440,8 +780,9 @@ export default function Home() {
       setFallConfidence(confidence);
       setCountdown(10);
       setPhase("verifying");
+      startVerificationRecording();
     },
-    [setPhase],
+    [setPhase, startVerificationRecording],
   );
 
   const resolveVerification = useCallback(
@@ -452,6 +793,7 @@ export default function Home() {
       ) {
         return;
       }
+      discardVerificationRecording();
       const duration = verificationStartedRef.current
         ? Math.max(
             1,
@@ -503,6 +845,7 @@ export default function Home() {
     },
     [
       addEvent,
+      discardVerificationRecording,
       fallConfidence,
       resetDetectionState,
       setPhase,
@@ -578,13 +921,15 @@ export default function Home() {
             ? closestTrackedLying ?? strongestLying
             : strongestLying;
 
-      setVisionStats({
+      const nextVisionStats = {
         people,
         objects: nonPeople,
         confidence:
           strongestLying?.confidence ?? strongestAnalysis.confidence,
         latencyMs: result.latencyMs,
-      });
+      };
+      visionStatsRef.current = nextVisionStats;
+      setVisionStats(nextVisionStats);
 
       if (manualScenarioRef.current) return;
 
@@ -841,7 +1186,7 @@ export default function Home() {
       pixelCanvas.width = Math.max(6, Math.round(width / 15));
       pixelCanvas.height = Math.max(6, Math.round(height / 15));
       const pixelContext = pixelCanvas.getContext("2d");
-      if (!pixelContext) return;
+      if (!pixelContext) return false;
 
       pixelContext.imageSmoothingEnabled = true;
       pixelContext.clearRect(0, 0, pixelCanvas.width, pixelCanvas.height);
@@ -873,6 +1218,53 @@ export default function Home() {
       context.drawImage(pixelCanvas, x, y, width, height);
       context.restore();
       context.imageSmoothingEnabled = true;
+      return true;
+    },
+    [],
+  );
+
+  const drawFullyPixelatedFrame = useCallback(
+    (
+      context: CanvasRenderingContext2D,
+      video: HTMLVideoElement,
+    ) => {
+      const canvas = context.canvas;
+      const privacyWidth = 64;
+      const privacyHeight = Math.max(
+        36,
+        Math.round((canvas.height / canvas.width) * privacyWidth),
+      );
+      if (!pixelCanvasRef.current) {
+        pixelCanvasRef.current = document.createElement("canvas");
+      }
+      const privacyCanvas = pixelCanvasRef.current;
+      privacyCanvas.width = privacyWidth;
+      privacyCanvas.height = privacyHeight;
+      const privacyContext = privacyCanvas.getContext("2d");
+
+      context.save();
+      context.globalAlpha = 1;
+      context.fillStyle = "#07150f";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      if (privacyContext) {
+        privacyContext.drawImage(
+          video,
+          0,
+          0,
+          privacyCanvas.width,
+          privacyCanvas.height,
+        );
+        context.imageSmoothingEnabled = false;
+        context.drawImage(
+          privacyCanvas,
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        );
+      }
+      context.restore();
+      return Boolean(privacyContext);
     },
     [],
   );
@@ -903,7 +1295,9 @@ export default function Home() {
 
     const result = latestResultRef.current;
     const resultIsFresh =
-      result && performance.now() - result.timestamp < 1_500;
+      result &&
+      performance.now() - result.timestamp < PRIVACY_RESULT_MAX_AGE_MS;
+    let anonymizationApplied = false;
 
     if (result && resultIsFresh) {
       const faceBoxes = result.faces
@@ -911,14 +1305,15 @@ export default function Home() {
         .filter((box): box is DetectionBox => Boolean(box));
 
       for (const faceBox of faceBoxes) {
-        drawPixelatedRegion(
-          context,
-          video,
-          faceBox,
-          result.frameWidth,
-          result.frameHeight,
-          0.34,
-        );
+        anonymizationApplied =
+          drawPixelatedRegion(
+            context,
+            video,
+            faceBox,
+            result.frameWidth,
+            result.frameHeight,
+            0.34,
+          ) || anonymizationApplied;
       }
 
       for (const pose of result.poses) {
@@ -932,14 +1327,15 @@ export default function Home() {
             width: Math.max(18, Math.max(...xs) - Math.min(...xs)),
             height: Math.max(22, Math.max(...ys) - Math.min(...ys)),
           };
-          drawPixelatedRegion(
-            context,
-            video,
-            poseFaceBox,
-            result.frameWidth,
-            result.frameHeight,
-            0.55,
-          );
+          anonymizationApplied =
+            drawPixelatedRegion(
+              context,
+              video,
+              poseFaceBox,
+              result.frameWidth,
+              result.frameHeight,
+              0.55,
+            ) || anonymizationApplied;
         }
       }
 
@@ -955,14 +1351,15 @@ export default function Home() {
           width: box.width * 0.52,
           height: box.height * 0.28,
         };
-        drawPixelatedRegion(
-          context,
-          video,
-          headBox,
-          result.frameWidth,
-          result.frameHeight,
-          0.2,
-        );
+        anonymizationApplied =
+          drawPixelatedRegion(
+            context,
+            video,
+            headBox,
+            result.frameWidth,
+            result.frameHeight,
+            0.2,
+          ) || anonymizationApplied;
       }
 
       const scaleX = canvas.width / result.frameWidth;
@@ -1012,31 +1409,49 @@ export default function Home() {
         }
       }
     } else {
-      const width = 64;
-      const height = Math.max(36, Math.round((canvas.height / canvas.width) * 64));
-      if (!pixelCanvasRef.current) {
-        pixelCanvasRef.current = document.createElement("canvas");
+      drawFullyPixelatedFrame(context, video);
+    }
+
+    // Only this fully rendered, face-anonymized frame is exposed to the
+    // recorder. The original camera MediaStream is never recorded.
+    const recordingCanvas = recordingCanvasRef.current;
+    if (recordingCanvas) {
+      const session = recordingSessionRef.current;
+      const recordingIsActive =
+        session?.state === "recording" || session?.state === "stopping";
+      if (!recordingIsActive) {
+        const scale = Math.min(1, 640 / canvas.width);
+        const width = Math.max(1, Math.round(canvas.width * scale));
+        const height = Math.max(1, Math.round(canvas.height * scale));
+        if (
+          recordingCanvas.width !== width ||
+          recordingCanvas.height !== height
+        ) {
+          recordingCanvas.width = width;
+          recordingCanvas.height = height;
+        }
       }
-      const privacyCanvas = pixelCanvasRef.current;
-      privacyCanvas.width = width;
-      privacyCanvas.height = height;
-      const privacyContext = privacyCanvas.getContext("2d");
-      if (privacyContext) {
-        privacyContext.drawImage(video, 0, 0, width, height);
-        context.save();
-        context.globalAlpha = 0.72;
-        context.imageSmoothingEnabled = false;
-        context.drawImage(
-          privacyCanvas,
-          0,
-          0,
-          canvas.width,
-          canvas.height,
-        );
-        context.restore();
+      const recordingContext = recordingCanvas.getContext("2d", {
+        alpha: false,
+      });
+      if (recordingContext) {
+        if (resultIsFresh && anonymizationApplied) {
+          recordingContext.drawImage(
+            canvas,
+            0,
+            0,
+            recordingCanvas.width,
+            recordingCanvas.height,
+          );
+        } else {
+          // A missing or stale privacy result must never expose a raw frame in
+          // a persisted clip. Full-frame pixelation replaces every source
+          // pixel until a verified face/person redaction is available.
+          drawFullyPixelatedFrame(recordingContext, video);
+        }
       }
     }
-  }, [drawPixelatedRegion]);
+  }, [drawFullyPixelatedFrame, drawPixelatedRegion]);
 
   const startRenderAndInferenceLoops = useCallback(() => {
     const render = () => {
@@ -1120,12 +1535,19 @@ export default function Home() {
       streamRef.current = null;
       if (videoRef.current) videoRef.current.srcObject = null;
       setCameraState("idle");
-      setVisionStats({ people: 0, objects: 0, confidence: 0, latencyMs: 0 });
+      const emptyVisionStats = {
+        people: 0,
+        objects: 0,
+        confidence: 0,
+        latencyMs: 0,
+      };
+      visionStatsRef.current = emptyVisionStats;
+      setVisionStats(emptyVisionStats);
       latestResultRef.current = null;
 
       if (
         alertPhaseRef.current === "verifying" &&
-        reason === "background"
+        reason
       ) {
         resolveVerification("interrupted");
       }
@@ -1234,6 +1656,86 @@ export default function Home() {
     showToast("iPhone은 공유 버튼에서 ‘홈 화면에 추가’를 선택해 주세요.");
   }, [installPrompt, showToast]);
 
+  const connectToControl = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!controlPassword) return;
+      setControlLoginBusy(true);
+      setControlLoginError("");
+      try {
+        const response = await fetch("/api/auth/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ password: controlPassword }),
+        });
+        const payload = (await response.json().catch(() => ({}))) as {
+          error?: string | { message?: string };
+        };
+        if (!response.ok) {
+          const serverMessage =
+            typeof payload.error === "string"
+              ? payload.error
+              : payload.error?.message;
+          throw new Error(
+            response.status === 429
+              ? "로그인 시도가 많습니다. 잠시 후 다시 시도해 주세요."
+              : serverMessage || "관제 접속 코드를 확인해 주세요.",
+          );
+        }
+        setControlPassword("");
+        setControlConnection("connected");
+        setShowControlLogin(false);
+        showToast("관제센터에 연결했습니다. 대기 영상을 전송합니다.");
+        void syncPendingClips();
+      } catch (error) {
+        setControlLoginError(
+          error instanceof Error
+            ? error.message
+            : "관제센터에 연결하지 못했습니다.",
+        );
+      } finally {
+        setControlLoginBusy(false);
+      }
+    },
+    [controlPassword, showToast, syncPendingClips],
+  );
+
+  const openEventClip = useCallback(
+    async (event: SafetyEvent) => {
+      const stored = await getEventClip(event.id);
+      if (stored.ok && stored.value) {
+        setSelectedClip((current) => {
+          if (current?.url.startsWith("blob:")) URL.revokeObjectURL(current.url);
+          return {
+            event,
+            url: URL.createObjectURL(stored.value!.blob),
+          };
+        });
+        return;
+      }
+      if (
+        controlConnection === "connected" &&
+        (event.clipState === "uploaded" || event.serverEventId)
+      ) {
+        setSelectedClip({
+          event,
+          url: `/api/events/${encodeURIComponent(event.serverEventId || event.id)}/clip`,
+        });
+        return;
+      }
+      showToast("이 기기에서 재생할 수 있는 영상이 없습니다.");
+    },
+    [controlConnection, showToast],
+  );
+
+  const closeEventClip = useCallback(() => {
+    setSelectedClip((current) => {
+      if (current?.url.startsWith("blob:")) URL.revokeObjectURL(current.url);
+      return null;
+    });
+  }, []);
+
   const runFallTest = useCallback(() => {
     if (alertPhaseRef.current !== "idle") return;
     beginVerification(0.86, true);
@@ -1300,6 +1802,19 @@ export default function Home() {
         setHistoryLoaded(true);
       }
 
+      try {
+        const savedDeviceId = window.localStorage.getItem(DEVICE_ID_KEY);
+        if (savedDeviceId) {
+          deviceIdRef.current = savedDeviceId;
+        } else {
+          const suffix = crypto.randomUUID().slice(0, 4).toUpperCase();
+          deviceIdRef.current = `모바일 순찰 ${suffix}`;
+          window.localStorage.setItem(DEVICE_ID_KEY, deviceIdRef.current);
+        }
+      } catch {
+        deviceIdRef.current = "모바일 순찰 01";
+      }
+
       if ("Notification" in window) {
         setNotificationPermission(Notification.permission);
       } else {
@@ -1314,6 +1829,29 @@ export default function Home() {
           ));
       setIsStandalone(standalone);
     }, 0);
+
+    void fetch("/api/auth/session", {
+      credentials: "same-origin",
+      cache: "no-store",
+    })
+      .then(async (response) => {
+        if (response.status === 503) {
+          setControlConnection("unavailable");
+          return;
+        }
+        const payload = (await response.json().catch(() => ({}))) as {
+          authenticated?: boolean;
+          configured?: boolean;
+        };
+        setControlConnection(
+          payload.configured === false
+            ? "unavailable"
+            : payload.authenticated
+              ? "connected"
+              : "disconnected",
+        );
+      })
+      .catch(() => setControlConnection("unavailable"));
 
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").catch(() => {
@@ -1331,6 +1869,12 @@ export default function Home() {
       window.removeEventListener("beforeinstallprompt", onBeforeInstall);
     };
   }, []);
+
+  useEffect(() => {
+    if (controlConnection === "connected" && historyLoaded) {
+      void syncPendingClips();
+    }
+  }, [controlConnection, historyLoaded, syncPendingClips]);
 
   useEffect(() => {
     const onVisibilityChange = () => {
@@ -1354,9 +1898,19 @@ export default function Home() {
       stopLoops();
       streamRef.current?.getTracks().forEach((track) => track.stop());
       workerRef.current?.terminate();
+      void recordingSessionRef.current?.discard();
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     },
     [stopLoops],
+  );
+
+  useEffect(
+    () => () => {
+      if (selectedClip?.url.startsWith("blob:")) {
+        URL.revokeObjectURL(selectedClip.url);
+      }
+    },
+    [selectedClip],
   );
 
   const todayEvents = useMemo(() => {
@@ -1405,6 +1959,28 @@ export default function Home() {
             <span className="status-dot" />
             {cameraStatusLabel}
           </span>
+          {controlConnection === "connected" ? (
+            <Link
+              className="control-connect-button is-connected"
+              href="/control"
+              aria-label="연결된 SAFEBOT 관제센터 열기"
+            >
+              <MonitorUp size={17} aria-hidden="true" />
+              <span>관제센터</span>
+            </Link>
+          ) : (
+            <button
+              className="control-connect-button"
+              onClick={() => {
+                setControlLoginError("");
+                setShowControlLogin(true);
+              }}
+              aria-label="SAFEBOT 관제센터 연결"
+            >
+              <LockKeyhole size={17} aria-hidden="true" />
+              <span>관제 연결</span>
+            </button>
+          )}
           <button
             className={`icon-button ${notificationPermission === "granted" ? "is-active" : ""}`}
             onClick={enableNotifications}
@@ -1445,6 +2021,14 @@ export default function Home() {
               <Settings2 size={19} aria-hidden="true" />
               운영 안내
             </button>
+            <Link className="side-nav-control" href="/control">
+              <MonitorUp size={19} aria-hidden="true" />
+              관제센터
+              <span
+                className={`control-link-dot state-${controlConnection}`}
+                aria-hidden="true"
+              />
+            </Link>
           </div>
 
           <div className="side-status-card">
@@ -1453,7 +2037,7 @@ export default function Home() {
             </div>
             <div>
               <strong>Privacy by default</strong>
-              <p>원본 영상은 업로드하지 않고 얼굴을 기기에서 익명화합니다.</p>
+              <p>원본·음성 없이 얼굴이 흐림 처리된 확정 영상만 저장합니다.</p>
             </div>
           </div>
         </aside>
@@ -1553,6 +2137,11 @@ export default function Home() {
                     className="analysis-canvas"
                     aria-hidden="true"
                   />
+                  <canvas
+                    ref={recordingCanvasRef}
+                    className="recording-canvas"
+                    aria-hidden="true"
+                  />
 
                   {cameraState !== "running" && (
                     <div className="camera-placeholder">
@@ -1600,6 +2189,12 @@ export default function Home() {
                           <ShieldCheck size={13} aria-hidden="true" />
                           RAW VIDEO OFF
                         </span>
+                        {recordingState === "recording" && (
+                          <span className="recording-chip">
+                            <span />
+                            10초 익명화 녹화
+                          </span>
+                        )}
                       </div>
                       <div className="vision-bottom-overlay">
                         <span>
@@ -1645,7 +2240,7 @@ export default function Home() {
                             : "기기 내 AI 대기"}
                       </strong>
                       <span>
-                        자세 · 얼굴 · 사물 분석 / 원본 영상 업로드 없음
+                        자세 · 얼굴 · 사물 분석 / 확정 시 익명화 영상만 저장
                       </span>
                     </div>
                   </div>
@@ -1755,20 +2350,23 @@ export default function Home() {
                 <div>
                   <span className="eyebrow">
                     <FileClock size={14} aria-hidden="true" />
-                    LOCAL EVENT LOG
+                    DEVICE EVENT LOG
                   </span>
                   <h1>안전 이벤트 이력</h1>
                   <p>
-                    알림·회복·오탐 기록은 현재 기기에만 저장됩니다. 저장된
-                    이미지는 이미 얼굴 익명화가 적용된 화면입니다.
+                    확정 이벤트는 얼굴이 흐림 처리된 무음 영상으로 최근 5건까지
+                    이 기기에 저장됩니다. 관제 연결 시 비공개 서버에도 전송됩니다.
                   </p>
                 </div>
                 {events.length > 0 && (
                   <button
                     className="button button-ghost"
                     onClick={() => {
+                      for (const event of eventsRef.current) {
+                        void deleteEventClip(event.id);
+                      }
                       persistEvents([]);
-                      showToast("이 기기의 이벤트 이력을 비웠습니다.");
+                      showToast("이 기기의 이벤트 이력과 영상을 비웠습니다.");
                     }}
                   >
                     <RotateCcw size={16} aria-hidden="true" />
@@ -1843,6 +2441,12 @@ export default function Home() {
                           {eventIcon(event.status)}
                           {eventStatusLabel(event.status)}
                         </span>
+                        {(event.clipBytes || event.clipState === "uploaded") && (
+                          <span className="event-video-badge">
+                            <Video size={12} aria-hidden="true" />
+                            10초
+                          </span>
+                        )}
                       </div>
                       <div className="event-body">
                         <div className="event-meta">
@@ -1876,9 +2480,40 @@ export default function Home() {
                                   : "발송 안 함"}
                             </strong>
                           </span>
+                          <span>
+                            <small>이벤트 영상</small>
+                            <strong>
+                              {event.clipState === "uploaded"
+                                ? "관제 저장"
+                                : event.clipBytes
+                                  ? `기기 저장 ${formatClipBytes(event.clipBytes)}`
+                                  : event.clipState === "unsupported"
+                                    ? "미지원"
+                                    : "없음"}
+                            </strong>
+                          </span>
                         </div>
                       </div>
-                      <ChevronRight className="event-chevron" size={20} aria-hidden="true" />
+                      {event.clipBytes || event.clipState === "uploaded" ? (
+                        <button
+                          className="event-play-button"
+                          onClick={() => void openEventClip(event)}
+                          aria-label={`${event.title} 10초 영상 보기`}
+                        >
+                          <Play
+                            size={17}
+                            fill="currentColor"
+                            aria-hidden="true"
+                          />
+                          영상 보기
+                        </button>
+                      ) : (
+                        <ChevronRight
+                          className="event-chevron"
+                          size={20}
+                          aria-hidden="true"
+                        />
+                      )}
                     </article>
                   ))
                 )}
@@ -1957,10 +2592,10 @@ export default function Home() {
                     <EyeOff size={20} aria-hidden="true" />
                   </div>
                   <span>03 · 최소 수집</span>
-                  <h2>원본 영상은 저장하지 않기</h2>
+                  <h2>확정된 익명화 영상만 저장하기</h2>
                   <p>
-                    이 MVP는 원본 영상을 서버로 전송하지 않습니다. 이력에는
-                    익명화 화면과 상태 정보만 기기에 저장합니다.
+                    원본과 음성은 저장하지 않습니다. 10초간 지속된 이벤트만
+                    얼굴 흐림 화면으로 기기와 비공개 관제 서버에 보관합니다.
                   </p>
                 </article>
                 <article>
@@ -2072,6 +2707,8 @@ export default function Home() {
             </h2>
             <p id="fall-verification-description">
               자세가 계속되면 기기 안전 알림을 생성합니다.
+              {recordingState === "recording" &&
+                " 얼굴 흐림 화면을 무음으로 임시 녹화 중입니다."}
               {manualScenario && " 현재는 기능 테스트입니다."}
             </p>
             <div className="fall-actions">
@@ -2124,6 +2761,155 @@ export default function Home() {
         </div>
       )}
 
+      {showControlLogin && (
+        <div
+          className="clip-modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) {
+              setShowControlLogin(false);
+            }
+          }}
+        >
+          <form
+            className="control-login-modal"
+            onSubmit={connectToControl}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="device-control-login-title"
+          >
+            <div className="clip-modal-heading">
+              <div>
+                <span className="eyebrow">SECURE CONTROL LINK</span>
+                <h2 id="device-control-login-title">관제센터 연결</h2>
+              </div>
+              <button
+                className="icon-button"
+                type="button"
+                onClick={() => setShowControlLogin(false)}
+                aria-label="관제 연결 닫기"
+              >
+                <X size={19} aria-hidden="true" />
+              </button>
+            </div>
+            <div className="control-login-description">
+              <span>
+                <UploadCloud size={21} aria-hidden="true" />
+              </span>
+              <div>
+                <strong>확정된 10초 영상만 전송합니다</strong>
+                <p>
+                  원본과 음성은 전송하지 않으며, 얼굴 흐림 처리가 끝난 영상만
+                  비공개 관제 이력에 7일간 보관합니다.
+                </p>
+              </div>
+            </div>
+            <label htmlFor="device-control-password">관제 접속 코드</label>
+            <input
+              id="device-control-password"
+              type="password"
+              value={controlPassword}
+              onChange={(event) => setControlPassword(event.target.value)}
+              autoComplete="current-password"
+              placeholder="접속 코드 입력"
+              disabled={
+                controlLoginBusy || controlConnection === "unavailable"
+              }
+              required
+              autoFocus
+            />
+            {controlLoginError && (
+              <div className="control-auth-error" role="alert">
+                <TriangleAlert size={16} aria-hidden="true" />
+                {controlLoginError}
+              </div>
+            )}
+            {controlConnection === "unavailable" && (
+              <div className="control-auth-error" role="status">
+                <TriangleAlert size={16} aria-hidden="true" />
+                관제 저장 서버가 아직 준비되지 않았습니다. 로컬 영상 저장은
+                계속 사용할 수 있습니다.
+              </div>
+            )}
+            <button
+              className="button button-primary"
+              type="submit"
+              disabled={
+                controlLoginBusy || controlConnection === "unavailable"
+              }
+            >
+              <KeyRound size={17} aria-hidden="true" />
+              {controlLoginBusy ? "연결 중" : "관제센터 연결"}
+            </button>
+            <Link href="/control">
+              <MonitorUp size={15} aria-hidden="true" />
+              관제센터 로그인 화면 열기
+            </Link>
+          </form>
+        </div>
+      )}
+
+      {selectedClip && (
+        <div
+          className="clip-modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) closeEventClip();
+          }}
+        >
+          <section
+            className="clip-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="local-clip-title"
+          >
+            <div className="clip-modal-heading">
+              <div>
+                <span className="eyebrow">ANONYMIZED EVENT CLIP</span>
+                <h2 id="local-clip-title">{selectedClip.event.title}</h2>
+              </div>
+              <button
+                className="icon-button"
+                onClick={closeEventClip}
+                aria-label="영상 닫기"
+              >
+                <X size={19} aria-hidden="true" />
+              </button>
+            </div>
+            <video
+              controls
+              autoPlay
+              playsInline
+              preload="metadata"
+              src={selectedClip.url}
+              poster={selectedClip.event.snapshot}
+            />
+            <div className="clip-modal-meta">
+              <span>
+                <Clock3 size={14} aria-hidden="true" />
+                {formatDate(selectedClip.event.createdAt)}{" "}
+                {formatTime(selectedClip.event.createdAt)}
+              </span>
+              <span>
+                <Video size={14} aria-hidden="true" />
+                약{" "}
+                {Math.max(
+                  1,
+                  Math.round(
+                    (selectedClip.event.clipDurationMs || 10_000) / 1000,
+                  ),
+                )}
+                초 · {formatClipBytes(selectedClip.event.clipBytes)}
+              </span>
+              <span>
+                <EyeOff size={14} aria-hidden="true" />
+                얼굴 흐림 · 음성 없음
+              </span>
+            </div>
+          </section>
+        </div>
+      )}
+
       <nav className="mobile-nav" aria-label="모바일 주요 메뉴">
         <button
           className={view === "patrol" ? "active" : ""}
@@ -2147,6 +2933,13 @@ export default function Home() {
           <Settings2 size={20} aria-hidden="true" />
           <span>안내</span>
         </button>
+        <Link href="/control">
+          <MonitorUp size={20} aria-hidden="true" />
+          <span>관제</span>
+          {controlConnection === "connected" && (
+            <b aria-label="관제센터 연결됨" />
+          )}
+        </Link>
       </nav>
 
       {toast &&

@@ -1,5 +1,11 @@
-const CACHE_NAME = "safebot-shell-v3";
+const CACHE_NAME = "safebot-shell-v4";
 const APP_SHELL = ["/", "/manifest.webmanifest", "/icons/icon-192.png"];
+const STATIC_PREFIXES = [
+  "/assets/",
+  "/icons/",
+  "/models/",
+  "/mediapipe/",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -29,11 +35,23 @@ self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
   const requestUrl = new URL(event.request.url);
   if (requestUrl.origin !== self.location.origin) return;
+  if (
+    requestUrl.pathname.startsWith("/api/") ||
+    requestUrl.pathname === "/control" ||
+    requestUrl.pathname.startsWith("/control/")
+  ) {
+    return;
+  }
+
+  const isStaticAsset =
+    APP_SHELL.includes(requestUrl.pathname) ||
+    STATIC_PREFIXES.some((prefix) => requestUrl.pathname.startsWith(prefix));
+  if (!isStaticAsset) return;
 
   event.respondWith(
     fetch(event.request)
       .then((response) => {
-        if (response.ok && requestUrl.pathname !== "/") {
+        if (response.ok) {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
         }
@@ -42,7 +60,12 @@ self.addEventListener("fetch", (event) => {
       .catch(() =>
         caches.match(event.request).then((cached) => {
           if (cached) return cached;
-          if (event.request.mode === "navigate") return caches.match("/");
+          if (
+            event.request.mode === "navigate" &&
+            requestUrl.pathname === "/"
+          ) {
+            return caches.match("/");
+          }
           return Response.error();
         }),
       ),
