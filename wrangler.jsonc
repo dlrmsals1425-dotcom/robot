@@ -16,12 +16,6 @@
       "migrations_dir": "migrations"
     }
   ],
-  "r2_buckets": [
-    {
-      "binding": "EVENT_MEDIA",
-      "bucket_name": "safebot-event-clips"
-    }
-  ],
   "triggers": {
     "crons": ["17 * * * *"]
   },

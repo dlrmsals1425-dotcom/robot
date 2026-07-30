@@ -153,7 +153,10 @@ test("ships anonymized clip recording, bounded local storage, and private event 
   assert.match(clipStore, /MAX_LOCAL_EVENT_CLIP_BYTES = 50 \* 1024 \* 1024/);
   assert.match(worker, /CONTROL_PASSWORD/);
   assert.match(worker, /SESSION_SECRET/);
-  assert.match(worker, /EVENT_MEDIA/);
+  assert.doesNotMatch(worker, /EVENT_MEDIA|R2Bucket/);
+  assert.match(worker, /event_media_chunks/);
+  assert.match(worker, /MEDIA_CHUNK_BYTES = 1_000_000/);
+  assert.match(worker, /MAX_ACTIVE_MEDIA_BYTES = 100_000_000/);
   assert.match(worker, /pathname === "\/api\/events"/);
   assert.match(worker, /eventMatchesUpload/);
   assert.match(worker, /idempotent: true/);

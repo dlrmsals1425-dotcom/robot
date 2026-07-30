@@ -9,7 +9,6 @@ import handler from "vinext/server/app-router-entry";
 interface Env {
   ASSETS: Fetcher;
   DB?: D1Database;
-  EVENT_MEDIA?: R2Bucket;
   CONTROL_PASSWORD?: string;
   SESSION_SECRET?: string;
   IMAGES?: {
@@ -63,12 +62,13 @@ type EventRow = {
   people: number | null;
   objects: number | null;
   device_id: string | null;
-  clip_key: string | null;
   clip_mime: string | null;
   clip_size: number | null;
-  poster_key: string | null;
   poster_mime: string | null;
   poster_size: number | null;
+  media_bytes: number;
+  clip_sha256: string | null;
+  poster_sha256: string | null;
   expires_at: number;
 };
 
@@ -80,8 +80,19 @@ type LoginAttemptRow = {
 
 type ExpiredEventRow = {
   id: string;
-  clip_key: string | null;
-  poster_key: string | null;
+};
+
+type MediaChunkRow = {
+  chunk_index: number;
+  bytes: unknown;
+  byte_length: number;
+};
+
+type PreparedMedia = {
+  mime: string;
+  size: number;
+  bytes: ArrayBuffer;
+  sha256: string;
 };
 
 type SessionClaims = {
@@ -98,6 +109,9 @@ const LOGIN_MAX_ATTEMPTS = 5;
 const EVENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const CLEANUP_BATCH_SIZE = 100;
 const MAX_CLEANUP_BATCHES = 10;
+const MEDIA_CHUNK_BYTES = 1_000_000;
+const MEDIA_READ_GROUP_CHUNKS = 4;
+const MAX_ACTIVE_MEDIA_BYTES = 100_000_000;
 const MAX_JSON_BODY_BYTES = 2 * 1024;
 const MAX_META_BYTES = 8 * 1024;
 const MAX_CLIP_BYTES = 12 * 1024 * 1024;
@@ -860,6 +874,26 @@ async function validateMedia(
   return { blob, mime, size: blob.size };
 }
 
+function bytesToHex(bytes: Uint8Array) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
+}
+
+async function prepareMedia(
+  media: { blob: Blob; mime: string; size: number } | null,
+): Promise<PreparedMedia | null> {
+  if (!media) return null;
+  const bytes = await media.blob.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return {
+    mime: media.mime,
+    size: media.size,
+    bytes,
+    sha256: bytesToHex(new Uint8Array(digest)),
+  };
+}
+
 function extensionForMime(mime: string) {
   switch (mime) {
     case "video/mp4":
@@ -876,8 +910,14 @@ function extensionForMime(mime: string) {
 }
 
 function eventResponse(row: EventRow) {
-  const clipUrl = row.clip_key ? `/api/events/${row.id}/clip` : null;
-  const posterUrl = row.poster_key ? `/api/events/${row.id}/poster` : null;
+  const clipUrl =
+    row.clip_sha256 && row.clip_mime && row.clip_size
+      ? `/api/events/${row.id}/clip`
+      : null;
+  const posterUrl =
+    row.poster_sha256 && row.poster_mime && row.poster_size
+      ? `/api/events/${row.id}/poster`
+      : null;
   return {
     id: row.id,
     status: row.status,
@@ -903,8 +943,9 @@ function eventResponse(row: EventRow) {
 
 const EVENT_COLUMNS = `
   id, status, title, detail, created_at, duration_seconds, confidence,
-  notification, people, objects, device_id, clip_key, clip_mime, clip_size,
-  poster_key, poster_mime, poster_size, expires_at
+  notification, people, objects, device_id, clip_mime, clip_size,
+  poster_mime, poster_size, media_bytes, clip_sha256, poster_sha256,
+  expires_at
 `;
 
 async function eventById(db: D1Database, id: string) {
@@ -917,8 +958,8 @@ async function eventById(db: D1Database, id: string) {
 function eventMatchesUpload(
   row: EventRow,
   meta: EventMeta,
-  clip: { mime: string; size: number } | null,
-  poster: { mime: string; size: number } | null,
+  clip: PreparedMedia | null,
+  poster: PreparedMedia | null,
 ) {
   return (
     row.status === meta.status &&
@@ -931,12 +972,15 @@ function eventMatchesUpload(
     row.people === (meta.people ?? null) &&
     row.objects === (meta.objects ?? null) &&
     row.device_id === (meta.deviceId ?? null) &&
-    Boolean(row.clip_key) === Boolean(clip) &&
+    Boolean(row.clip_sha256) === Boolean(clip) &&
     row.clip_mime === (clip?.mime ?? null) &&
     row.clip_size === (clip?.size ?? null) &&
-    Boolean(row.poster_key) === Boolean(poster) &&
+    row.clip_sha256 === (clip?.sha256 ?? null) &&
+    Boolean(row.poster_sha256) === Boolean(poster) &&
     row.poster_mime === (poster?.mime ?? null) &&
-    row.poster_size === (poster?.size ?? null)
+    row.poster_size === (poster?.size ?? null) &&
+    row.poster_sha256 === (poster?.sha256 ?? null) &&
+    row.media_bytes === (clip?.size ?? 0) + (poster?.size ?? 0)
   );
 }
 
@@ -973,6 +1017,83 @@ async function listEvents(request: Request, env: Env) {
     );
   }
   return jsonResponse({ events: result.results.map(eventResponse) });
+}
+
+function mediaChunkStatements(
+  db: D1Database,
+  eventId: string,
+  kind: "clip" | "poster",
+  media: PreparedMedia | null,
+) {
+  if (!media) return [];
+  const source = new Uint8Array(media.bytes);
+  const statements: D1PreparedStatement[] = [];
+  for (
+    let offset = 0, chunkIndex = 0;
+    offset < source.byteLength;
+    offset += MEDIA_CHUNK_BYTES, chunkIndex += 1
+  ) {
+    const chunk = source.slice(
+      offset,
+      Math.min(source.byteLength, offset + MEDIA_CHUNK_BYTES),
+    );
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO event_media_chunks (
+             event_id, kind, chunk_index, bytes, byte_length
+           )
+           VALUES (?1, ?2, ?3, ?4, ?5)`,
+        )
+        .bind(eventId, kind, chunkIndex, chunk.buffer, chunk.byteLength),
+    );
+  }
+  return statements;
+}
+
+function eventInsertStatement(
+  db: D1Database,
+  id: string,
+  meta: EventMeta,
+  clip: PreparedMedia | null,
+  poster: PreparedMedia | null,
+  expiresAt: number,
+) {
+  const mediaBytes = (clip?.size ?? 0) + (poster?.size ?? 0);
+  return db
+    .prepare(
+      `INSERT INTO safety_events (
+         id, status, title, detail, created_at, duration_seconds, confidence,
+         notification, people, objects, device_id, clip_mime, clip_size,
+         poster_mime, poster_size, expires_at,
+         media_bytes, clip_sha256, poster_sha256
+       )
+       VALUES (
+         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+         ?14, ?15, ?16, ?17, ?18, ?19
+       )`,
+    )
+    .bind(
+      id,
+      meta.status,
+      meta.title,
+      meta.detail,
+      Date.parse(meta.createdAt),
+      meta.durationSeconds,
+      meta.confidence,
+      meta.notification,
+      meta.people ?? null,
+      meta.objects ?? null,
+      meta.deviceId ?? null,
+      clip?.mime ?? null,
+      clip?.size ?? null,
+      poster?.mime ?? null,
+      poster?.size ?? null,
+      expiresAt,
+      mediaBytes,
+      clip?.sha256 ?? null,
+      poster?.sha256 ?? null,
+    );
 }
 
 async function createEvent(request: Request, env: Env) {
@@ -1016,13 +1137,15 @@ async function createEvent(request: Request, env: Env) {
     );
   }
   validateFormEnvelope(form);
-  const [meta, clip, poster] = await Promise.all([
+  const [meta, validatedClip, validatedPoster] = await Promise.all([
     formMeta(form),
     validateMedia(formBlob(form, "clip"), "clip"),
     validateMedia(formBlob(form, "poster"), "poster"),
   ]);
   if (
-    (clip?.size ?? 0) + (poster?.size ?? 0) + MAX_META_BYTES >
+    (validatedClip?.size ?? 0) +
+      (validatedPoster?.size ?? 0) +
+      MAX_META_BYTES >
     MAX_MULTIPART_BYTES
   ) {
     throw new ApiError(
@@ -1031,13 +1154,10 @@ async function createEvent(request: Request, env: Env) {
       "이벤트 업로드의 크기가 너무 큽니다.",
     );
   }
-  if ((clip || poster) && !env.EVENT_MEDIA) {
-    throw new ApiError(
-      503,
-      "MEDIA_STORAGE_NOT_CONFIGURED",
-      "비공개 영상 저장소가 연결되지 않았습니다.",
-    );
-  }
+  const [clip, poster] = await Promise.all([
+    prepareMedia(validatedClip),
+    prepareMedia(validatedPoster),
+  ]);
 
   const id = meta.id ?? crypto.randomUUID();
   const existing = await eventById(env.DB, id);
@@ -1055,95 +1175,34 @@ async function createEvent(request: Request, env: Env) {
     );
   }
 
-  const createdAt = Date.parse(meta.createdAt);
   const expiresAt = Date.now() + EVENT_RETENTION_MS;
-  // A request-unique object prefix prevents a losing concurrent INSERT from
-  // deleting the media committed by the winning request with the same event ID.
-  const prefix = `events/${id}/${crypto.randomUUID()}`;
-  const clipKey = clip
-    ? `${prefix}/clip.${extensionForMime(clip.mime)}`
-    : null;
-  const posterKey = poster
-    ? `${prefix}/poster.${extensionForMime(poster.mime)}`
-    : null;
-  const uploadedKeys: string[] = [];
-
+  const statements = [
+    eventInsertStatement(env.DB, id, meta, clip, poster, expiresAt),
+    ...mediaChunkStatements(env.DB, id, "clip", clip),
+    ...mediaChunkStatements(env.DB, id, "poster", poster),
+  ];
   try {
-    if (clip && clipKey && env.EVENT_MEDIA) {
-      await env.EVENT_MEDIA.put(clipKey, clip.blob, {
-        httpMetadata: {
-          contentType: clip.mime,
-          cacheControl: "private, no-store",
-          contentDisposition: `inline; filename="${id}.${extensionForMime(clip.mime)}"`,
-        },
-        customMetadata: {
-          eventId: id,
-          expiresAt: new Date(expiresAt).toISOString(),
-          privacy: "face-blurred-no-audio",
-        },
-      });
-      uploadedKeys.push(clipKey);
-    }
-    if (poster && posterKey && env.EVENT_MEDIA) {
-      await env.EVENT_MEDIA.put(posterKey, poster.blob, {
-        httpMetadata: {
-          contentType: poster.mime,
-          cacheControl: "private, no-store",
-          contentDisposition: `inline; filename="${id}.${extensionForMime(poster.mime)}"`,
-        },
-        customMetadata: {
-          eventId: id,
-          expiresAt: new Date(expiresAt).toISOString(),
-          privacy: "face-blurred",
-        },
-      });
-      uploadedKeys.push(posterKey);
-    }
-
-    await env.DB
-      .prepare(
-        `INSERT INTO safety_events (
-           id, status, title, detail, created_at, duration_seconds, confidence,
-           notification, people, objects, device_id, clip_key, clip_mime,
-           clip_size, poster_key, poster_mime, poster_size, expires_at
-         ) VALUES (
-           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-           ?15, ?16, ?17, ?18
-         )`,
-      )
-      .bind(
-        id,
-        meta.status,
-        meta.title,
-        meta.detail,
-        createdAt,
-        meta.durationSeconds,
-        meta.confidence,
-        meta.notification,
-        meta.people ?? null,
-        meta.objects ?? null,
-        meta.deviceId ?? null,
-        clipKey,
-        clip?.mime ?? null,
-        clip?.size ?? null,
-        posterKey,
-        poster?.mime ?? null,
-        poster?.size ?? null,
-        expiresAt,
-      )
-      .run();
-  } catch {
-    if (uploadedKeys.length > 0 && env.EVENT_MEDIA) {
-      await env.EVENT_MEDIA.delete(uploadedKeys).catch(() => undefined);
-    }
+    await env.DB.batch(statements);
+  } catch (error) {
     const concurrentWinner = await eventById(env.DB, id).catch(() => null);
-    if (
-      concurrentWinner &&
-      eventMatchesUpload(concurrentWinner, meta, clip, poster)
-    ) {
-      return jsonResponse(
-        { event: eventResponse(concurrentWinner), idempotent: true },
-        200,
+    if (concurrentWinner) {
+      if (eventMatchesUpload(concurrentWinner, meta, clip, poster)) {
+        return jsonResponse(
+          { event: eventResponse(concurrentWinner), idempotent: true },
+          200,
+        );
+      }
+      throw new ApiError(
+        409,
+        "EVENT_ALREADY_EXISTS",
+        "같은 ID에 다른 내용의 이벤트가 이미 저장되어 있습니다.",
+      );
+    }
+    if (String(error).includes("MEDIA_STORAGE_LIMIT_REACHED")) {
+      throw new ApiError(
+        507,
+        "MEDIA_STORAGE_LIMIT_REACHED",
+        `서버 영상 보관 한도(${MAX_ACTIVE_MEDIA_BYTES / 1_000_000}MB)에 도달했습니다. 오래된 이력을 삭제한 뒤 다시 시도해 주세요.`,
       );
     }
     throw new ApiError(
@@ -1159,6 +1218,13 @@ async function createEvent(request: Request, env: Env) {
       503,
       "EVENT_SAVE_FAILED",
       "저장된 이벤트를 확인하지 못했습니다.",
+    );
+  }
+  if (!eventMatchesUpload(saved, meta, clip, poster)) {
+    throw new ApiError(
+      409,
+      "EVENT_ALREADY_EXISTS",
+      "같은 ID에 다른 내용의 이벤트가 이미 저장되어 있습니다.",
     );
   }
   return jsonResponse({ event: eventResponse(saved) }, 201);
@@ -1184,6 +1250,121 @@ function parseRange(value: string, size: number) {
   return { offset: start, length: end - start + 1 };
 }
 
+function chunkBytes(value: unknown) {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (Array.isArray(value) && value.every((byte) => Number.isInteger(byte))) {
+    return Uint8Array.from(value as number[]);
+  }
+  throw new ApiError(
+    503,
+    "MEDIA_READ_FAILED",
+    "저장 영상 조각을 읽지 못했습니다.",
+  );
+}
+
+async function readMediaRange(
+  db: D1Database,
+  eventId: string,
+  kind: "clip" | "poster",
+  offset: number,
+  length: number,
+) {
+  const firstChunk = Math.floor(offset / MEDIA_CHUNK_BYTES);
+  const lastChunk = Math.floor((offset + length - 1) / MEDIA_CHUNK_BYTES);
+  const rows: MediaChunkRow[] = [];
+  try {
+    for (
+      let groupStart = firstChunk;
+      groupStart <= lastChunk;
+      groupStart += MEDIA_READ_GROUP_CHUNKS
+    ) {
+      const groupEnd = Math.min(
+        lastChunk,
+        groupStart + MEDIA_READ_GROUP_CHUNKS - 1,
+      );
+      const result = await db
+        .prepare(
+          `SELECT chunk_index, bytes, byte_length
+           FROM event_media_chunks
+           WHERE event_id = ?1
+             AND kind = ?2
+             AND chunk_index BETWEEN ?3 AND ?4
+           ORDER BY chunk_index ASC`,
+        )
+        .bind(eventId, kind, groupStart, groupEnd)
+        .all<MediaChunkRow>();
+      rows.push(...result.results);
+    }
+  } catch {
+    throw new ApiError(
+      503,
+      "MEDIA_READ_FAILED",
+      "저장 영상을 불러오지 못했습니다.",
+    );
+  }
+
+  if (rows.length !== lastChunk - firstChunk + 1) {
+    throw new ApiError(
+      503,
+      "MEDIA_INCOMPLETE",
+      "저장 영상 조각이 누락되었습니다.",
+    );
+  }
+
+  const output = new Uint8Array(length);
+  let written = 0;
+  for (
+    let expectedIndex = firstChunk;
+    expectedIndex <= lastChunk;
+    expectedIndex += 1
+  ) {
+    const row = rows[expectedIndex - firstChunk];
+    const bytes = row ? chunkBytes(row.bytes) : null;
+    if (
+      !row ||
+      row.chunk_index !== expectedIndex ||
+      !bytes ||
+      bytes.byteLength !== row.byte_length ||
+      bytes.byteLength > MEDIA_CHUNK_BYTES
+    ) {
+      throw new ApiError(
+        503,
+        "MEDIA_INCOMPLETE",
+        "저장 영상 조각이 손상되었습니다.",
+      );
+    }
+
+    const chunkStart = expectedIndex * MEDIA_CHUNK_BYTES;
+    const startInChunk = Math.max(0, offset - chunkStart);
+    const endInChunk = Math.min(
+      bytes.byteLength,
+      offset + length - chunkStart,
+    );
+    if (endInChunk <= startInChunk) {
+      throw new ApiError(
+        503,
+        "MEDIA_INCOMPLETE",
+        "저장 영상 범위를 구성하지 못했습니다.",
+      );
+    }
+    const piece = bytes.subarray(startInChunk, endInChunk);
+    output.set(piece, written);
+    written += piece.byteLength;
+  }
+
+  if (written !== length) {
+    throw new ApiError(
+      503,
+      "MEDIA_INCOMPLETE",
+      "저장 영상의 길이가 일치하지 않습니다.",
+    );
+  }
+  return output;
+}
+
 async function serveEventMedia(
   request: Request,
   env: Env,
@@ -1193,20 +1374,22 @@ async function serveEventMedia(
   if (!EVENT_ID_PATTERN.test(id)) {
     throw new ApiError(404, "EVENT_NOT_FOUND", "이벤트를 찾을 수 없습니다.");
   }
-  if (!env.DB || !env.EVENT_MEDIA) {
+  if (!env.DB) {
     throw new ApiError(
       503,
-      "MEDIA_STORAGE_NOT_CONFIGURED",
-      "비공개 영상 저장소가 연결되지 않았습니다.",
+      "DATABASE_NOT_CONFIGURED",
+      "이벤트 데이터베이스가 연결되지 않았습니다.",
     );
   }
   const event = await eventById(env.DB, id);
   if (!event || event.expires_at <= Date.now()) {
     throw new ApiError(404, "EVENT_NOT_FOUND", "이벤트를 찾을 수 없습니다.");
   }
-  const key = kind === "clip" ? event.clip_key : event.poster_key;
   const mime = kind === "clip" ? event.clip_mime : event.poster_mime;
-  if (!key || !mime) {
+  const size = kind === "clip" ? event.clip_size : event.poster_size;
+  const checksum =
+    kind === "clip" ? event.clip_sha256 : event.poster_sha256;
+  if (!mime || !size || !checksum) {
     throw new ApiError(
       404,
       "MEDIA_NOT_FOUND",
@@ -1216,51 +1399,50 @@ async function serveEventMedia(
     );
   }
 
-  const objectHead = await env.EVENT_MEDIA.head(key);
-  if (!objectHead) {
-    throw new ApiError(404, "MEDIA_NOT_FOUND", "저장된 파일이 없습니다.");
-  }
   const headers = new Headers();
-  objectHead.writeHttpMetadata(headers);
   headers.set("Accept-Ranges", "bytes");
   headers.set("Cache-Control", "private, no-store");
   headers.set("Content-Type", mime);
-  headers.set("ETag", objectHead.httpEtag);
-  headers.set("Last-Modified", objectHead.uploaded.toUTCString());
+  headers.set(
+    "Content-Disposition",
+    `inline; filename="${id}.${extensionForMime(mime)}"`,
+  );
+  headers.set("ETag", `"${checksum}"`);
+  headers.set("Last-Modified", new Date(event.created_at).toUTCString());
   headers.set("Referrer-Policy", "no-referrer");
   headers.set("X-Content-Type-Options", "nosniff");
 
   const rangeHeader = request.headers.get("Range");
   if (rangeHeader) {
-    const range = parseRange(rangeHeader, objectHead.size);
+    const range = parseRange(rangeHeader, size);
     if (!range) {
-      headers.set("Content-Range", `bytes */${objectHead.size}`);
+      headers.set("Content-Range", `bytes */${size}`);
       return new Response(null, { status: 416, headers });
     }
     headers.set(
       "Content-Range",
-      `bytes ${range.offset}-${range.offset + range.length - 1}/${objectHead.size}`,
+      `bytes ${range.offset}-${range.offset + range.length - 1}/${size}`,
     );
     headers.set("Content-Length", String(range.length));
     if (request.method === "HEAD") {
       return new Response(null, { status: 206, headers });
     }
-    const object = await env.EVENT_MEDIA.get(key, { range });
-    if (!object) {
-      throw new ApiError(404, "MEDIA_NOT_FOUND", "저장된 파일이 없습니다.");
-    }
-    return new Response(object.body, { status: 206, headers });
+    const bytes = await readMediaRange(
+      env.DB,
+      id,
+      kind,
+      range.offset,
+      range.length,
+    );
+    return new Response(bytes, { status: 206, headers });
   }
 
-  headers.set("Content-Length", String(objectHead.size));
+  headers.set("Content-Length", String(size));
   if (request.method === "HEAD") {
     return new Response(null, { status: 200, headers });
   }
-  const object = await env.EVENT_MEDIA.get(key);
-  if (!object) {
-    throw new ApiError(404, "MEDIA_NOT_FOUND", "저장된 파일이 없습니다.");
-  }
-  return new Response(object.body, { status: 200, headers });
+  const bytes = await readMediaRange(env.DB, id, kind, 0, size);
+  return new Response(bytes, { status: 200, headers });
 }
 
 async function deleteEvent(env: Env, id: string) {
@@ -1278,43 +1460,29 @@ async function deleteEvent(env: Env, id: string) {
   if (!event) {
     throw new ApiError(404, "EVENT_NOT_FOUND", "이벤트를 찾을 수 없습니다.");
   }
-  const keys = [event.clip_key, event.poster_key].filter(
-    (key): key is string => Boolean(key),
-  );
-  if (keys.length > 0) {
-    if (!env.EVENT_MEDIA) {
-      throw new ApiError(
-        503,
-        "MEDIA_STORAGE_NOT_CONFIGURED",
-        "비공개 영상 저장소가 연결되지 않았습니다.",
-      );
-    }
-    try {
-      await env.EVENT_MEDIA.delete(keys);
-    } catch {
-      throw new ApiError(
-        503,
-        "EVENT_DELETE_FAILED",
-        "저장 영상을 삭제하지 못했습니다.",
-      );
-    }
+  try {
+    await env.DB
+      .prepare("DELETE FROM safety_events WHERE id = ?1")
+      .bind(id)
+      .run();
+  } catch {
+    throw new ApiError(
+      503,
+      "EVENT_DELETE_FAILED",
+      "이벤트와 저장 영상을 삭제하지 못했습니다.",
+    );
   }
-  await env.DB
-    .prepare("DELETE FROM safety_events WHERE id = ?1")
-    .bind(id)
-    .run();
   return jsonResponse({ ok: true });
 }
 
 async function cleanupExpiredEvents(env: Env) {
   const db = env.DB;
-  const media = env.EVENT_MEDIA;
-  if (!db || !media) return;
+  if (!db) return;
   const now = Date.now();
   for (let batch = 0; batch < MAX_CLEANUP_BATCHES; batch += 1) {
     const expired = await db
       .prepare(
-        `SELECT id, clip_key, poster_key
+        `SELECT id
          FROM safety_events
          WHERE expires_at <= ?1
          ORDER BY expires_at ASC
@@ -1324,17 +1492,13 @@ async function cleanupExpiredEvents(env: Env) {
       .all<ExpiredEventRow>();
     if (expired.results.length === 0) break;
 
-    const keys = expired.results.flatMap((event) =>
-      [event.clip_key, event.poster_key].filter(
-        (key): key is string => Boolean(key),
-      ),
-    );
-    if (keys.length > 0) await media.delete(keys);
-    await db.batch(
-      expired.results.map((event) =>
-        db.prepare("DELETE FROM safety_events WHERE id = ?1").bind(event.id),
-      ),
-    );
+    const placeholders = expired.results
+      .map((_, index) => `?${index + 1}`)
+      .join(", ");
+    await db
+      .prepare(`DELETE FROM safety_events WHERE id IN (${placeholders})`)
+      .bind(...expired.results.map((event) => event.id))
+      .run();
     if (expired.results.length < CLEANUP_BATCH_SIZE) break;
   }
   await db
