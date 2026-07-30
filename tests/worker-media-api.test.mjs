@@ -200,8 +200,18 @@ function uploadRequest(cookie, meta, clipBytes, posterBytes) {
   });
 }
 
-test("D1 quota trigger rolls back failed chunk batches and decrements once on cascade delete", async () => {
+test("D1 usage CHECK and media writes roll back atomically", async () => {
   const db = await createDatabase();
+  const reserveUsage = (bytes) =>
+    db
+      .prepare(
+        `INSERT INTO media_usage (singleton, active_bytes, updated_at)
+         VALUES (1, ?1, 1)
+         ON CONFLICT(singleton) DO UPDATE SET
+           active_bytes = media_usage.active_bytes + excluded.active_bytes,
+           updated_at = excluded.updated_at`,
+      )
+      .bind(bytes);
   const eventInsert = db
     .prepare(
       `INSERT INTO safety_events (
@@ -218,7 +228,9 @@ test("D1 quota trigger rolls back failed chunk batches and decrements once on ca
     )
     .bind("atomic-event", new Uint8Array([1, 2, 3]).buffer);
 
-  await assert.rejects(db.batch([eventInsert, invalidChunk]));
+  await assert.rejects(
+    db.batch([reserveUsage(3), eventInsert, invalidChunk]),
+  );
   assert.equal(
     db.sqlite.prepare("SELECT COUNT(*) AS count FROM safety_events").get()
       .count,
@@ -230,27 +242,85 @@ test("D1 quota trigger rolls back failed chunk batches and decrements once on ca
     0,
   );
 
-  const insertUsageEvent = db.sqlite.prepare(
-    `INSERT INTO safety_events (
-       id, status, title, detail, created_at, duration_seconds, confidence,
-       notification, expires_at, media_bytes
-     ) VALUES (?, 'emergency', 't', 'd', 1, 10, 0.9, 'sent', 9999999999999, ?)`,
+  const capacityEvent = (id, bytes) =>
+    db
+      .prepare(
+        `INSERT INTO safety_events (
+           id, status, title, detail, created_at, duration_seconds, confidence,
+           notification, expires_at, media_bytes
+         ) VALUES (
+           ?1, 'emergency', 't', 'd', 1, 10, 0.9, 'sent',
+           9999999999999, ?2
+         )`,
+      )
+      .bind(id, bytes);
+
+  db.sqlite.exec("DELETE FROM media_usage");
+  await db.batch([
+    reserveUsage(3),
+    capacityEvent("singleton-recovery", 3),
+  ]);
+  assert.equal(
+    db.sqlite.prepare("SELECT active_bytes FROM media_usage").get()
+      .active_bytes,
+    3,
   );
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE media_usage
+         SET active_bytes = active_bytes - (
+           SELECT media_bytes FROM safety_events WHERE id = ?1
+         )
+         WHERE singleton = 1`,
+      )
+      .bind("singleton-recovery"),
+    db
+      .prepare("DELETE FROM safety_events WHERE id = ?1")
+      .bind("singleton-recovery"),
+  ]);
+
   for (let index = 0; index < 7; index += 1) {
-    insertUsageEvent.run(`capacity-${index}`, 13_000_000);
+    await db.batch([
+      reserveUsage(13_000_000),
+      capacityEvent(`capacity-${index}`, 13_000_000),
+    ]);
   }
-  insertUsageEvent.run("capacity-final", 9_000_000);
+  await db.batch([
+    reserveUsage(9_000_000),
+    capacityEvent("capacity-final", 9_000_000),
+  ]);
   assert.equal(
     db.sqlite.prepare("SELECT active_bytes FROM media_usage").get()
       .active_bytes,
     100_000_000,
   );
-  assert.throws(
-    () => insertUsageEvent.run("capacity-over", 1),
-    /MEDIA_STORAGE_LIMIT_REACHED/,
+  await assert.rejects(
+    db.batch([
+      reserveUsage(1),
+      capacityEvent("capacity-over", 1),
+    ]),
+    /media_usage_active_bytes_limit/,
+  );
+  assert.equal(
+    db.sqlite
+      .prepare(
+        "SELECT COUNT(*) AS count FROM safety_events WHERE id = 'capacity-over'",
+      )
+      .get().count,
+    0,
   );
 
-  db.sqlite.exec("DELETE FROM safety_events");
+  await db.batch([
+    db.prepare(
+      `UPDATE media_usage
+       SET active_bytes = active_bytes - (
+         SELECT COALESCE(SUM(media_bytes), 0) FROM safety_events
+       )
+       WHERE singleton = 1`,
+    ),
+    db.prepare("DELETE FROM safety_events"),
+  ]);
   assert.equal(
     db.sqlite.prepare("SELECT active_bytes FROM media_usage").get()
       .active_bytes,
@@ -258,7 +328,7 @@ test("D1 quota trigger rolls back failed chunk batches and decrements once on ca
   );
 });
 
-test("concurrent identical uploads are idempotent, Range reads cross only needed chunks, and expiry cleanup is atomic", async () => {
+test("concurrent uploads, Range, manual delete, and 99-event cleanup preserve D1 usage", async () => {
   const worker = await loadWorker();
   const db = await createDatabase();
   const env = environment(db);
@@ -347,9 +417,64 @@ test("concurrent identical uploads are idempotent, Range reads cross only needed
   );
   assert.equal((await headResponse.arrayBuffer()).byteLength, 0);
 
+  const deleteContext = createContext();
+  const deleteResponse = await worker.fetch(
+    new Request(`${origin}/api/events/${meta.id}`, {
+      method: "DELETE",
+      headers: { cookie, origin },
+    }),
+    env,
+    deleteContext,
+  );
+  await deleteContext.drain();
+  assert.equal(deleteResponse.status, 200);
+  assert.equal(
+    db.sqlite.prepare("SELECT COUNT(*) AS count FROM event_media_chunks").get()
+      .count,
+    0,
+  );
+  assert.equal(
+    db.sqlite.prepare("SELECT active_bytes FROM media_usage").get()
+      .active_bytes,
+    0,
+  );
+
+  const cleanupMeta = eventMeta(
+    "cleanup-event-001",
+    new Date().toISOString(),
+  );
+  const cleanupUploadContext = createContext();
+  const cleanupUpload = await worker.fetch(
+    uploadRequest(cookie, cleanupMeta, clip, poster),
+    env,
+    cleanupUploadContext,
+  );
+  await cleanupUploadContext.drain();
+  assert.equal(cleanupUpload.status, 201);
   db.sqlite
     .prepare("UPDATE safety_events SET expires_at = 0 WHERE id = ?")
-    .run(meta.id);
+    .run(cleanupMeta.id);
+  const insertExpired = db.sqlite.prepare(
+    `INSERT INTO safety_events (
+       id, status, title, detail, created_at, duration_seconds, confidence,
+       notification, expires_at, media_bytes
+     ) VALUES (
+       ?, 'interrupted', 'expired', 'expired', 1, 0, 0,
+       'not_sent', 0, 0
+     )`,
+  );
+  for (let index = 0; index < 98; index += 1) {
+    insertExpired.run(`expired-event-${String(index).padStart(3, "0")}`);
+  }
+  assert.equal(
+    db.sqlite
+      .prepare(
+        "SELECT COUNT(*) AS count FROM safety_events WHERE expires_at <= 0",
+      )
+      .get().count,
+    99,
+  );
+
   const cleanupContext = createContext();
   await worker.fetch(
     new Request(`${origin}/api/events`, { headers: { cookie } }),

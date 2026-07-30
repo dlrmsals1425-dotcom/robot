@@ -15,10 +15,10 @@ ALTER TABLE safety_events
 
 CREATE TABLE media_usage (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  active_bytes INTEGER NOT NULL DEFAULT 0 CHECK (
-    active_bytes >= 0 AND active_bytes <= 100000000
-  ),
-  updated_at INTEGER NOT NULL
+  active_bytes INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  CONSTRAINT media_usage_active_bytes_limit
+    CHECK (active_bytes >= 0 AND active_bytes <= 100000000)
 );
 
 INSERT INTO media_usage (singleton, active_bytes, updated_at)
@@ -41,42 +41,3 @@ CREATE TABLE event_media_chunks (
   PRIMARY KEY (event_id, kind, chunk_index),
   FOREIGN KEY (event_id) REFERENCES safety_events(id) ON DELETE CASCADE
 ) WITHOUT ROWID;
-
-CREATE TRIGGER safety_events_media_quota_before_insert
-BEFORE INSERT ON safety_events
-WHEN NEW.media_bytes > 0
-BEGIN
-  SELECT CASE
-    WHEN NOT EXISTS (
-      SELECT 1
-      FROM media_usage
-      WHERE singleton = 1
-        AND active_bytes + NEW.media_bytes <= 100000000
-    )
-    THEN RAISE(ABORT, 'MEDIA_STORAGE_LIMIT_REACHED')
-  END;
-
-  UPDATE media_usage
-  SET
-    active_bytes = active_bytes + NEW.media_bytes,
-    updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000
-  WHERE singleton = 1;
-END;
-
-CREATE TRIGGER safety_events_media_usage_after_delete
-AFTER DELETE ON safety_events
-WHEN OLD.media_bytes > 0
-BEGIN
-  UPDATE media_usage
-  SET
-    active_bytes = MAX(0, active_bytes - OLD.media_bytes),
-    updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000
-  WHERE singleton = 1;
-END;
-
-CREATE TRIGGER safety_events_media_bytes_immutable
-BEFORE UPDATE OF media_bytes ON safety_events
-WHEN NEW.media_bytes <> OLD.media_bytes
-BEGIN
-  SELECT RAISE(ABORT, 'MEDIA_BYTES_IMMUTABLE');
-END;

@@ -78,10 +78,6 @@ type LoginAttemptRow = {
   blocked_until: number;
 };
 
-type ExpiredEventRow = {
-  id: string;
-};
-
 type MediaChunkRow = {
   chunk_index: number;
   bytes: unknown;
@@ -107,8 +103,8 @@ const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_BLOCK_MS = 15 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 5;
 const EVENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const CLEANUP_BATCH_SIZE = 100;
-const MAX_CLEANUP_BATCHES = 10;
+const CLEANUP_BATCH_SIZE = 99;
+const MAX_CLEANUP_BATCHES = 8;
 const MEDIA_CHUNK_BYTES = 1_000_000;
 const MEDIA_READ_GROUP_CHUNKS = 4;
 const MAX_ACTIVE_MEDIA_BYTES = 100_000_000;
@@ -1176,7 +1172,17 @@ async function createEvent(request: Request, env: Env) {
   }
 
   const expiresAt = Date.now() + EVENT_RETENTION_MS;
+  const mediaBytes = (clip?.size ?? 0) + (poster?.size ?? 0);
   const statements = [
+    env.DB
+      .prepare(
+        `INSERT INTO media_usage (singleton, active_bytes, updated_at)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET
+           active_bytes = media_usage.active_bytes + excluded.active_bytes,
+           updated_at = excluded.updated_at`,
+      )
+      .bind(mediaBytes, Date.now()),
     eventInsertStatement(env.DB, id, meta, clip, poster, expiresAt),
     ...mediaChunkStatements(env.DB, id, "clip", clip),
     ...mediaChunkStatements(env.DB, id, "poster", poster),
@@ -1198,7 +1204,7 @@ async function createEvent(request: Request, env: Env) {
         "같은 ID에 다른 내용의 이벤트가 이미 저장되어 있습니다.",
       );
     }
-    if (String(error).includes("MEDIA_STORAGE_LIMIT_REACHED")) {
+    if (String(error).includes("media_usage_active_bytes_limit")) {
       throw new ApiError(
         507,
         "MEDIA_STORAGE_LIMIT_REACHED",
@@ -1461,11 +1467,61 @@ async function deleteEvent(env: Env, id: string) {
     throw new ApiError(404, "EVENT_NOT_FOUND", "이벤트를 찾을 수 없습니다.");
   }
   try {
-    await env.DB
-      .prepare("DELETE FROM safety_events WHERE id = ?1")
-      .bind(id)
-      .run();
-  } catch {
+    const [, deleteResult] = await env.DB.batch([
+      env.DB
+        .prepare(
+          `UPDATE media_usage
+           SET
+             active_bytes = active_bytes - COALESCE((
+               SELECT media_bytes
+               FROM safety_events
+               WHERE id = ?1
+                 AND created_at = ?2
+                 AND expires_at = ?3
+                 AND clip_sha256 IS ?4
+                 AND poster_sha256 IS ?5
+             ), 0),
+             updated_at = ?6
+           WHERE singleton = 1`,
+        )
+        .bind(
+          id,
+          event.created_at,
+          event.expires_at,
+          event.clip_sha256,
+          event.poster_sha256,
+          Date.now(),
+        ),
+      env.DB
+        .prepare(
+          `DELETE FROM safety_events
+           WHERE id = ?1
+             AND created_at = ?2
+             AND expires_at = ?3
+             AND clip_sha256 IS ?4
+             AND poster_sha256 IS ?5`,
+        )
+        .bind(
+          id,
+          event.created_at,
+          event.expires_at,
+          event.clip_sha256,
+          event.poster_sha256,
+        ),
+    ]);
+    if ((deleteResult.meta.changes ?? 0) === 0) {
+      const current = await eventById(env.DB, id);
+      if (current) {
+        throw new ApiError(
+          409,
+          "EVENT_CHANGED",
+          "이벤트가 변경되어 삭제하지 않았습니다. 이력을 새로고침해 주세요.",
+        );
+      }
+      return jsonResponse({ ok: true, idempotent: true });
+    }
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
     throw new ApiError(
       503,
       "EVENT_DELETE_FAILED",
@@ -1480,26 +1536,41 @@ async function cleanupExpiredEvents(env: Env) {
   if (!db) return;
   const now = Date.now();
   for (let batch = 0; batch < MAX_CLEANUP_BATCHES; batch += 1) {
-    const expired = await db
-      .prepare(
-        `SELECT id
-         FROM safety_events
-         WHERE expires_at <= ?1
-         ORDER BY expires_at ASC
-         LIMIT ?2`,
-      )
-      .bind(now, CLEANUP_BATCH_SIZE)
-      .all<ExpiredEventRow>();
-    if (expired.results.length === 0) break;
-
-    const placeholders = expired.results
-      .map((_, index) => `?${index + 1}`)
-      .join(", ");
-    await db
-      .prepare(`DELETE FROM safety_events WHERE id IN (${placeholders})`)
-      .bind(...expired.results.map((event) => event.id))
-      .run();
-    if (expired.results.length < CLEANUP_BATCH_SIZE) break;
+    const [, deleteResult] = await db.batch([
+      db
+        .prepare(
+          `UPDATE media_usage
+           SET
+             active_bytes = active_bytes - COALESCE((
+               SELECT SUM(media_bytes)
+               FROM safety_events
+               WHERE id IN (
+                 SELECT id
+                 FROM safety_events
+                 WHERE expires_at <= ?1
+                 ORDER BY expires_at ASC, id ASC
+                 LIMIT ?2
+               )
+             ), 0),
+             updated_at = ?3
+           WHERE singleton = 1`,
+        )
+        .bind(now, CLEANUP_BATCH_SIZE, Date.now()),
+      db
+        .prepare(
+          `DELETE FROM safety_events
+           WHERE id IN (
+             SELECT id
+             FROM safety_events
+             WHERE expires_at <= ?1
+             ORDER BY expires_at ASC, id ASC
+             LIMIT ?2
+           )`,
+        )
+        .bind(now, CLEANUP_BATCH_SIZE),
+    ]);
+    const deleted = deleteResult.meta.changes ?? 0;
+    if (deleted === 0 || deleted < CLEANUP_BATCH_SIZE) break;
   }
   await db
     .prepare("DELETE FROM login_attempts WHERE updated_at < ?1")
