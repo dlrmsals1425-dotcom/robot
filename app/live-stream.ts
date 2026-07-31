@@ -1,3 +1,9 @@
+import {
+  DEFAULT_LIVE_ICE_SERVERS,
+  fetchLiveIceServers,
+  hasTurnIceServer,
+} from "./live-ice";
+
 export type LiveBroadcastState =
   | "idle"
   | "connecting"
@@ -43,12 +49,14 @@ type PeerEntry = {
 
 const FRAME_RATE = 12;
 const MAX_VIEWERS = 3;
-const MAX_VIDEO_BITRATE = 600_000;
+const MAX_VIDEO_BITRATE = 350_000;
+const MAX_VIDEO_SHORT_EDGE = 360;
+const MAX_VIDEO_LONG_EDGE = 480;
+const MAX_PEER_RETRY_ATTEMPTS = 3;
 const MAX_RECONNECT_ATTEMPTS = 6;
 const STABLE_SIGNALING_MS = 30_000;
 const PEER_NEGOTIATION_TIMEOUT_MS = 15_000;
 const PEER_DISCONNECTED_TIMEOUT_MS = 8_000;
-const CLOUDFLARE_STUN_URL = "stun:stun.cloudflare.com:3478";
 const RELAY_FRAME_INTERVAL_MS = 1_000;
 const RELAY_FRAME_WIDTH = 320;
 const RELAY_FRAME_MAX_HEIGHT = 640;
@@ -122,7 +130,11 @@ export class LiveBroadcastSender {
     | LiveBroadcastOptions["onAuthenticationExpired"];
   private socket: WebSocket | null = null;
   private stream: MediaStream | null = null;
+  private streamCanvas: HTMLCanvasElement | null = null;
+  private streamCanvasTimer: number | null = null;
   private peers = new Map<string, PeerEntry>();
+  private peerRetryTimers = new Map<string, number>();
+  private peerRetryAttempts = new Map<string, number>();
   private reconnectTimer: number | null = null;
   private stabilityTimer: number | null = null;
   private reconnectAttempts = 0;
@@ -133,6 +145,7 @@ export class LiveBroadcastSender {
   private relayCanvas: HTMLCanvasElement | null = null;
   private relayTimer: number | null = null;
   private relayEncoding = false;
+  private iceServersPromise: Promise<RTCIceServer[]> | null = null;
   private lastSnapshot = IDLE_LIVE_BROADCAST;
 
   constructor({
@@ -169,13 +182,11 @@ export class LiveBroadcastSender {
       return;
     }
 
-    if (
-      typeof RTCPeerConnection !== "undefined" &&
-      typeof this.canvas.captureStream === "function"
-    ) {
+    const streamCanvas = this.prepareStreamCanvas();
+    if (typeof RTCPeerConnection !== "undefined" && streamCanvas) {
       let capturedStream: MediaStream | null = null;
       try {
-        capturedStream = this.canvas.captureStream(FRAME_RATE);
+        capturedStream = streamCanvas.captureStream(FRAME_RATE);
         // Canvas capture never contains audio. Stop defensively if a browser
         // implementation ever returns an unexpected audio track.
         capturedStream.getAudioTracks().forEach((track) => track.stop());
@@ -201,11 +212,13 @@ export class LiveBroadcastSender {
         // relay remains available on browsers where canvas capture fails.
         capturedStream?.getTracks().forEach((track) => track.stop());
         this.stream = null;
+        this.clearStreamCanvas();
       }
     }
 
     this.wanted = true;
     this.reconnectAttempts = 0;
+    void this.loadIceServers();
     this.emit({
       state: "connecting",
       viewerCount: 0,
@@ -236,6 +249,8 @@ export class LiveBroadcastSender {
 
     this.closeAllPeers();
     this.clearRelayState();
+    this.clearStreamCanvas();
+    this.iceServersPromise = null;
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
     this.reconnectAttempts = 0;
@@ -340,6 +355,7 @@ export class LiveBroadcastSender {
         this.confirmedRelayViewerIds.delete(viewerId);
         this.startRelayLoop();
         this.emitLive();
+        this.schedulePeerRetry(viewerId, socket);
       }
       return;
     }
@@ -404,7 +420,10 @@ export class LiveBroadcastSender {
 
     if (type === "viewer-joined") {
       const viewerId = getString(message.viewerId);
-      if (viewerId) await this.createPeer(viewerId, socket);
+      if (viewerId) {
+        this.peerRetryAttempts.delete(viewerId);
+        await this.createPeer(viewerId, socket);
+      }
       return;
     }
 
@@ -428,6 +447,8 @@ export class LiveBroadcastSender {
         this.relayViewerIds.delete(peerId);
         this.confirmedRelayViewerIds.delete(peerId);
         if (this.relayViewerIds.size === 0) this.clearRelayTimer();
+        this.clearPeerRetry(peerId);
+        this.peerRetryAttempts.delete(peerId);
         this.closePeer(peerId);
       }
       return;
@@ -462,11 +483,22 @@ export class LiveBroadcastSender {
     const track = this.stream?.getVideoTracks()[0];
     if (!track || track.readyState !== "live") return;
 
+    const iceServers = await this.loadIceServers();
+    if (
+      !this.wanted ||
+      this.socket !== socket ||
+      this.peers.has(viewerId) ||
+      this.peers.size >= MAX_VIEWERS
+    ) {
+      return;
+    }
+
     let connection: RTCPeerConnection;
     try {
       connection = new RTCPeerConnection({
-        iceServers: [{ urls: CLOUDFLARE_STUN_URL }],
+        iceServers,
         bundlePolicy: "max-bundle",
+        iceTransportPolicy: "all",
       });
     } catch {
       // The viewer can still request the authenticated JPEG fallback when a
@@ -488,11 +520,15 @@ export class LiveBroadcastSender {
         connection.connectionState !== "connected"
       ) {
         this.closePeer(viewerId);
+        this.schedulePeerRetry(viewerId, socket);
       }
     }, PEER_NEGOTIATION_TIMEOUT_MS);
 
     const sender = connection.addTrack(track, this.stream!);
-    void this.limitSenderBitrate(sender);
+    if (!(await this.limitSenderBitrate(sender))) {
+      this.closePeer(viewerId);
+      return;
+    }
 
     connection.onicecandidate = (event) => {
       if (!event.candidate || !this.wanted) return;
@@ -506,6 +542,8 @@ export class LiveBroadcastSender {
       if (connection.connectionState === "connected") {
         this.clearPeerTimer(entry, "negotiationTimer");
         this.clearPeerTimer(entry, "disconnectedTimer");
+        this.clearPeerRetry(viewerId);
+        this.peerRetryAttempts.delete(viewerId);
         this.emitLive();
       } else if (connection.connectionState === "disconnected") {
         this.emitLive();
@@ -516,6 +554,7 @@ export class LiveBroadcastSender {
               connection.connectionState !== "connected"
             ) {
               this.closePeer(viewerId);
+              this.schedulePeerRetry(viewerId, socket);
             }
           }, PEER_DISCONNECTED_TIMEOUT_MS);
         }
@@ -524,6 +563,7 @@ export class LiveBroadcastSender {
         connection.connectionState === "closed"
       ) {
         this.closePeer(viewerId);
+        this.schedulePeerRetry(viewerId, socket);
       }
     };
 
@@ -550,6 +590,7 @@ export class LiveBroadcastSender {
       });
     } catch {
       this.closePeer(viewerId);
+      this.schedulePeerRetry(viewerId, socket);
     }
   }
 
@@ -557,13 +598,120 @@ export class LiveBroadcastSender {
     try {
       const parameters = sender.getParameters();
       if (!parameters.encodings || parameters.encodings.length === 0) {
-        parameters.encodings = [{}];
+        return false;
       }
-      parameters.encodings[0].maxBitrate = MAX_VIDEO_BITRATE;
+      const encoding = parameters.encodings[0];
+      encoding.maxBitrate = MAX_VIDEO_BITRATE;
+      encoding.maxFramerate = FRAME_RATE;
       await sender.setParameters(parameters);
+      const applied = sender.getParameters().encodings?.[0];
+      return Boolean(
+        applied?.maxBitrate &&
+          applied.maxBitrate <= MAX_VIDEO_BITRATE,
+      );
     } catch {
-      // Some mobile browsers do not expose encoding controls. The stream
-      // remains limited to a 640px canvas at 12fps.
+      // Unbounded WebRTC would undermine the Realtime usage guardrail. The
+      // viewer will receive the authenticated one-frame-per-second fallback.
+      return false;
+    }
+  }
+
+  private prepareStreamCanvas() {
+    if (typeof this.canvas.captureStream !== "function") return null;
+    const streamCanvas = this.canvas.ownerDocument.createElement("canvas");
+    const shortEdge = Math.max(
+      1,
+      Math.min(this.canvas.width, this.canvas.height),
+    );
+    const longEdge = Math.max(this.canvas.width, this.canvas.height);
+    const scale = Math.min(
+      1,
+      MAX_VIDEO_SHORT_EDGE / shortEdge,
+      MAX_VIDEO_LONG_EDGE / longEdge,
+    );
+    streamCanvas.width = Math.max(1, Math.round(this.canvas.width * scale));
+    streamCanvas.height = Math.max(1, Math.round(this.canvas.height * scale));
+    const context = streamCanvas.getContext("2d", { alpha: false });
+    if (!context) return null;
+    const copySafeFrame = () => {
+      if (this.streamCanvas !== streamCanvas || this.disposed) return;
+      context.drawImage(
+        this.canvas,
+        0,
+        0,
+        streamCanvas.width,
+        streamCanvas.height,
+      );
+    };
+    this.streamCanvas = streamCanvas;
+    copySafeFrame();
+    this.streamCanvasTimer = window.setInterval(
+      copySafeFrame,
+      Math.round(1000 / FRAME_RATE),
+    );
+    return streamCanvas;
+  }
+
+  private clearStreamCanvas() {
+    if (this.streamCanvasTimer !== null) {
+      window.clearInterval(this.streamCanvasTimer);
+      this.streamCanvasTimer = null;
+    }
+    this.streamCanvas = null;
+  }
+
+  private loadIceServers() {
+    if (!this.iceServersPromise) {
+      const pending = fetchLiveIceServers();
+      this.iceServersPromise = pending;
+      void pending.then((servers) => {
+        if (
+          this.iceServersPromise === pending &&
+          !hasTurnIceServer(servers)
+        ) {
+          this.iceServersPromise = null;
+        }
+      });
+    }
+    return this.iceServersPromise ?? Promise.resolve(DEFAULT_LIVE_ICE_SERVERS);
+  }
+
+  private schedulePeerRetry(viewerId: string, socket: WebSocket) {
+    if (
+      !this.wanted ||
+      this.socket !== socket ||
+      this.peerRetryTimers.has(viewerId) ||
+      this.peers.get(viewerId)?.connection.connectionState === "connected"
+    ) {
+      return;
+    }
+    const attempts = this.peerRetryAttempts.get(viewerId) ?? 0;
+    if (attempts >= MAX_PEER_RETRY_ATTEMPTS) return;
+    this.peerRetryAttempts.set(viewerId, attempts + 1);
+    const timer = window.setTimeout(
+      () => {
+        this.peerRetryTimers.delete(viewerId);
+        if (!this.wanted || this.socket !== socket) return;
+        if (
+          this.peers.get(viewerId)?.connection.connectionState === "connected"
+        ) {
+          this.peerRetryAttempts.delete(viewerId);
+          return;
+        }
+        this.closePeer(viewerId);
+        this.iceServersPromise = null;
+        void this.createPeer(viewerId, socket);
+      },
+      Math.min(10_000, 2_000 * 2 ** attempts),
+    );
+    this.peerRetryTimers.set(viewerId, timer);
+  }
+
+  private clearPeerRetry(viewerId: string) {
+    const timer = this.peerRetryTimers.get(viewerId);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      this.peerRetryTimers.delete(viewerId);
     }
   }
 
@@ -619,6 +767,11 @@ export class LiveBroadcastSender {
       entry.connection.close();
     }
     this.peers.clear();
+    for (const timer of this.peerRetryTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.peerRetryTimers.clear();
+    this.peerRetryAttempts.clear();
   }
 
   private clearPeerTimer(

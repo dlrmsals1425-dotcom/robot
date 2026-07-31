@@ -1,6 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  DEFAULT_LIVE_ICE_SERVERS,
+  fetchLiveIceServers,
+} from "../live-ice";
 
 export type LiveViewerState = "connecting" | "live" | "offline";
 export type LiveViewerTransport = "webrtc" | "relay" | null;
@@ -326,10 +330,16 @@ export function useLiveViewer(enabled: boolean) {
       closePeer(relayFrameUrlRef.current ? "live" : "connecting");
       pendingCandidates = [];
 
+      const iceServers =
+        (await fetchLiveIceServers()) ?? DEFAULT_LIVE_ICE_SERVERS;
+      if (disposed || !target || broadcasterId !== target) return;
+
       let nextPeer: RTCPeerConnection;
       try {
         nextPeer = new RTCPeerConnection({
-          iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }],
+          iceServers,
+          bundlePolicy: "max-bundle",
+          iceTransportPolicy: "all",
         });
       } catch {
         requestRelayFallback();

@@ -180,8 +180,8 @@ test("ships anonymized clip recording, bounded local storage, and private event 
   assert.match(packageJson, /"migrate:cloudflare"/);
 });
 
-test("ships authenticated anonymized live control with a zero-subscription relay fallback", async () => {
-  const [page, sender, viewer, worker, control, wrangler] =
+test("ships authenticated low-bandwidth TURN live control with a relay fallback", async () => {
+  const [page, sender, viewer, ice, worker, control, wrangler] =
     await Promise.all([
       readFile(new URL("app/page.tsx", templateRoot), "utf8"),
       readFile(new URL("app/live-stream.ts", templateRoot), "utf8"),
@@ -189,6 +189,7 @@ test("ships authenticated anonymized live control with a zero-subscription relay
         new URL("app/control/use-live-viewer.ts", templateRoot),
         "utf8",
       ),
+      readFile(new URL("app/live-ice.ts", templateRoot), "utf8"),
       readFile(new URL("worker/index.ts", templateRoot), "utf8"),
       readFile(
         new URL("app/control/control-center.tsx", templateRoot),
@@ -223,12 +224,19 @@ test("ships authenticated anonymized live control with a zero-subscription relay
     page,
     /cameraState === "running"\s*&&\s*controlConnection === "connected"\s*&&/,
   );
-  assert.match(sender, /this\.canvas\.captureStream\(FRAME_RATE\)/);
+  assert.match(sender, /streamCanvas\.captureStream\(FRAME_RATE\)/);
   assert.match(sender, /getAudioTracks\(\).*track\.stop\(\)/);
   assert.doesNotMatch(sender, /streamRef|navigator\.mediaDevices|getUserMedia/);
-  assert.match(sender, /stun:stun\.cloudflare\.com:3478/);
-  assert.doesNotMatch(sender, /\bturns?:/i);
-  assert.match(sender, /MAX_VIDEO_BITRATE = 600_000/);
+  assert.match(sender, /fetchLiveIceServers\(\)/);
+  assert.match(sender, /MAX_VIDEO_BITRATE = 350_000/);
+  assert.match(sender, /MAX_VIDEO_SHORT_EDGE = 360/);
+  assert.match(sender, /MAX_VIDEO_LONG_EDGE = 480/);
+  assert.match(sender, /prepareStreamCanvas/);
+  assert.match(sender, /await this\.limitSenderBitrate\(sender\)/);
+  assert.match(sender, /encoding\.maxFramerate = FRAME_RATE/);
+  assert.doesNotMatch(sender, /encoding\.scaleResolutionDownBy/);
+  assert.match(sender, /schedulePeerRetry/);
+  assert.match(sender, /iceTransportPolicy: "all"/);
   assert.match(sender, /MAX_RECONNECT_ATTEMPTS = 6/);
   assert.match(sender, /RELAY_FRAME_WIDTH = 320/);
   assert.match(sender, /MAX_RELAY_FRAME_BYTES = 48 \* 1024/);
@@ -237,18 +245,34 @@ test("ships authenticated anonymized live control with a zero-subscription relay
   assert.match(sender, /socket\.send\(await frame\.arrayBuffer\(\)\)/);
   assert.match(sender, /type === "relay-request"/);
 
-  assert.match(viewer, /stun:stun\.cloudflare\.com:3478/);
-  assert.doesNotMatch(viewer, /\bturns?:/i);
+  assert.match(viewer, /fetchLiveIceServers\(\)/);
+  assert.match(viewer, /iceTransportPolicy: "all"/);
   assert.match(viewer, /MAX_RECONNECT_ATTEMPTS = 8/);
   assert.match(viewer, /send\(\{ type: "relay-request" \}\)/);
   assert.match(viewer, /send\(\{ type: "relay-ack" \}\)/);
   assert.match(viewer, /nextSocket\.binaryType = "arraybuffer"/);
   assert.match(viewer, /new Blob\(\[buffer\], \{ type: "image\/jpeg" \}\)/);
   assert.match(control, /현장 실시간 관제/);
+  assert.match(control, /절약형 LIVE · 360p/);
   assert.match(control, /저속 RELAY · 1fps/);
   assert.match(control, /중계 프레임은 서버에 저장하지 않습니다/);
 
+  assert.match(ice, /\/api\/live\/ice-servers/);
+  assert.match(ice, /credentials: "same-origin"/);
+  assert.match(ice, /cache: "no-store"/);
+  assert.match(ice, /stun:stun\.cloudflare\.com:3478/);
+  assert.match(ice, /turns\?:turn\\\.cloudflare/);
+  assert.match(ice, /DEFAULT_LIVE_ICE_SERVERS/);
+
   assert.match(worker, /assertLiveSocketOrigin\(request\)/);
+  assert.match(worker, /handleLiveIceServers/);
+  assert.match(worker, /TURN_KEY_API_TOKEN/);
+  assert.match(worker, /generate-ice-servers/);
+  assert.match(worker, /TURN_CREDENTIAL_TTL_SECONDS = 60 \* 60/);
+  assert.match(worker, /TURN_PROVIDER_MAX_ATTEMPTS_PER_WINDOW = 3/);
+  assert.match(worker, /TURN_CACHE_STORAGE_KEY/);
+  assert.match(worker, /turnCredentialBrokerName/);
+  assert.match(worker, /MAX_TURN_RESPONSE_BYTES = 16 \* 1024/);
   assert.match(worker, /await requireSession\(request, env\)/);
   assert.match(worker, /MAX_LIVE_VIEWERS = 3/);
   assert.match(worker, /MAX_RELAY_FRAME_BYTES = 48 \* 1024/);
@@ -263,4 +287,5 @@ test("ships authenticated anonymized live control with a zero-subscription relay
   assert.match(wrangler, /"name": "LIVE_ROOM"/);
   assert.match(wrangler, /"new_sqlite_classes": \["LiveRoom"\]/);
   assert.doesNotMatch(wrangler, /r2_buckets/i);
+  assert.doesNotMatch(wrangler, /TURN_KEY_API_TOKEN|turn\.cloudflare\.com/i);
 });

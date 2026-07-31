@@ -291,7 +291,7 @@ export default function ControlCenter() {
     liveViewerState === "live"
       ? liveTransport === "relay"
         ? "저속 RELAY · 1fps"
-        : "LIVE"
+        : "절약형 LIVE · 360p"
       : liveViewerState === "connecting"
         ? "실시간 연결 중"
         : "현장기기 오프라인";
@@ -619,7 +619,7 @@ export default function ControlCenter() {
                     {isLive
                       ? liveTransport === "relay"
                         ? "직접 연결이 막힌 네트워크에서 익명화된 무음 화면만 초당 1장으로 임시 중계합니다. 중계 프레임은 서버에 저장하지 않습니다."
-                        : "WebRTC로 현장 영상을 실시간 수신합니다. 확정된 10초 사건 영상은 아래 이력에도 계속 보관됩니다."
+                        : "Cloudflare TURN을 지원하는 절약형 WebRTC로 익명화된 무음 영상을 최대 360p·12fps·350kbps로 수신합니다. 확정된 10초 사건 영상은 아래 이력에도 계속 보관됩니다."
                       : "실시간 영상이 없을 때는 가장 최근에 저장된 10초 사건 영상을 표시합니다."}
                   </p>
                   {!isLive && (
@@ -649,7 +649,7 @@ export default function ControlCenter() {
                     <span />
                     {liveTransport === "relay"
                       ? "저속 중계 연결됨"
-                      : "실시간 연결됨"}
+                      : "절약형 실시간 연결됨"}
                   </span>
                 ) : (
                   <span className="control-status">{liveStatusLabel}</span>

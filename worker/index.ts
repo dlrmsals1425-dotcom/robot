@@ -12,6 +12,8 @@ interface Env {
   LIVE_ROOM?: DurableObjectNamespace;
   CONTROL_PASSWORD?: string;
   SESSION_SECRET?: string;
+  TURN_KEY_ID?: string;
+  TURN_KEY_API_TOKEN?: string;
   IMAGES?: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -118,6 +120,21 @@ type LiveRoomSnapshot = {
   viewers: Array<{ socket: WebSocket; state: LiveSocketAttachment }>;
 };
 
+type TurnCredentialCache = {
+  iceServers: Array<{
+    urls: string | string[];
+    username?: string;
+    credential?: string;
+  }>;
+  expiresAt: number;
+};
+
+type TurnCredentialRateState = {
+  windowStartedAt: number;
+  attempts: number;
+  lastFailureAt: number;
+};
+
 const SESSION_COOKIE = "__Host-safebot_session";
 const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -135,6 +152,24 @@ const MAX_CLIP_BYTES = 12 * 1024 * 1024;
 const MAX_POSTER_BYTES = 1024 * 1024;
 const LIVE_ROOM_NAME = "safebot-main-room";
 const LIVE_SESSION_EXPIRY_HEADER = "X-Safebot-Session-Expires-At";
+const TURN_CREDENTIAL_TTL_SECONDS = 60 * 60;
+const TURN_CREDENTIAL_EXPIRY_SAFETY_SECONDS = 30;
+const TURN_CREDENTIAL_REFRESH_MARGIN_MS = 2 * 60 * 1000;
+const TURN_CREDENTIAL_MIN_TTL_SECONDS = 60;
+const TURN_PROVIDER_RATE_WINDOW_MS = 60 * 60 * 1000;
+const TURN_PROVIDER_MAX_ATTEMPTS_PER_WINDOW = 3;
+const TURN_PROVIDER_FAILURE_COOLDOWN_MS = 30 * 1000;
+const TURN_CACHE_STORAGE_KEY = "turn-credential-cache";
+const TURN_RATE_STORAGE_KEY = "turn-credential-rate";
+const TURN_BROKER_PREFIX = "safebot-turn-broker";
+const TURN_MAX_EXPIRES_AT_HEADER = "X-Safebot-Turn-Max-Expires-At";
+const TURN_KEY_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/u;
+const TURN_API_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,256}$/u;
+const MAX_TURN_ICE_SERVERS = 4;
+const MAX_TURN_URLS_PER_SERVER = 8;
+const MAX_TURN_VALUE_LENGTH = 1024;
+const MAX_TURN_RESPONSE_BYTES = 16 * 1024;
+const TURN_UPSTREAM_TIMEOUT_MS = 5_000;
 const MAX_LIVE_VIEWERS = 3;
 const MAX_LIVE_CONNECTIONS = MAX_LIVE_VIEWERS + 1;
 const MAX_SIGNAL_MESSAGE_BYTES = 64 * 1024;
@@ -1668,6 +1703,142 @@ function assertLiveSocketOrigin(request: Request) {
   assertSameOrigin(request);
 }
 
+function allowedCloudflareIceUrl(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_TURN_VALUE_LENGTH
+  ) {
+    return false;
+  }
+  return (
+    /^stun:stun\.cloudflare\.com:3478$/u.test(value) ||
+    /^turns?:turn\.cloudflare\.com:(?:3478|80|443|5349)(?:\?transport=(?:udp|tcp))?$/u.test(
+      value,
+    )
+  );
+}
+
+function sanitizeCloudflareIceServer(value: unknown) {
+  if (!isRecord(value)) return null;
+  const rawUrls = Array.isArray(value.urls) ? value.urls : [value.urls];
+  const urls = rawUrls
+    .slice(0, MAX_TURN_URLS_PER_SERVER)
+    .filter(allowedCloudflareIceUrl);
+  if (urls.length === 0) return null;
+
+  const hasTurnUrl = urls.some((url) => url.startsWith("turn"));
+  if (!hasTurnUrl) {
+    return { urls: urls.length === 1 ? urls[0] : urls };
+  }
+  if (
+    typeof value.username !== "string" ||
+    value.username.length === 0 ||
+    value.username.length > MAX_TURN_VALUE_LENGTH ||
+    typeof value.credential !== "string" ||
+    value.credential.length === 0 ||
+    value.credential.length > MAX_TURN_VALUE_LENGTH
+  ) {
+    return null;
+  }
+  return {
+    urls: urls.length === 1 ? urls[0] : urls,
+    username: value.username,
+    credential: value.credential,
+  };
+}
+
+function sanitizeCloudflareIceServers(value: unknown) {
+  if (!Array.isArray(value)) return null;
+  const iceServers = value
+    .slice(0, MAX_TURN_ICE_SERVERS)
+    .map(sanitizeCloudflareIceServer)
+    .filter((server) => server !== null);
+  const hasTurnServer = iceServers.some((server) => {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    return urls.some((url) => url.startsWith("turn"));
+  });
+  return hasTurnServer ? iceServers : null;
+}
+
+function turnCredentialResponse(cache: TurnCredentialCache) {
+  const expiresInSeconds = Math.max(
+    0,
+    Math.floor((cache.expiresAt - Date.now()) / 1000),
+  );
+  return jsonResponse({
+    iceServers: cache.iceServers,
+    expiresAt: cache.expiresAt,
+    expiresInSeconds,
+    profile: {
+      width: 480,
+      height: 360,
+      frameRate: 12,
+      maxVideoBitrate: 350_000,
+      audio: false,
+      maxViewers: MAX_LIVE_VIEWERS,
+    },
+  });
+}
+
+async function turnCredentialBrokerName(request: Request, secret: string) {
+  const cookie = getCookie(request, SESSION_COOKIE) ?? "";
+  const address = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  return `${TURN_BROKER_PREFIX}-${bytesToBase64Url(
+    await hmac(secret, `${cookie}:${address}`),
+  )}`;
+}
+
+async function handleLiveIceServers(request: Request, env: Env) {
+  if (request.method !== "POST") return methodNotAllowed(["POST"]);
+  const origin = request.headers.get("Origin");
+  if (!origin || origin !== new URL(request.url).origin) {
+    throw new ApiError(
+      403,
+      "CROSS_ORIGIN_REQUEST",
+      "동일한 SAFEBOT 사이트에서만 원격 영상 중계를 요청할 수 있습니다.",
+    );
+  }
+  assertSameOrigin(request);
+  const claims = await requireSession(request, env);
+  if (!env.LIVE_ROOM || !env.SESSION_SECRET) {
+    throw new ApiError(
+      503,
+      "TURN_NOT_CONFIGURED",
+      "원격 영상 중계가 아직 준비되지 않았습니다.",
+    );
+  }
+  const maxExpiresAt = Math.min(
+    claims.exp * 1000,
+    Date.now() + TURN_CREDENTIAL_TTL_SECONDS * 1000,
+  );
+  if (
+    maxExpiresAt - Date.now() <
+    (TURN_CREDENTIAL_MIN_TTL_SECONDS +
+      TURN_CREDENTIAL_EXPIRY_SAFETY_SECONDS) *
+      1000
+  ) {
+    throw new ApiError(
+      401,
+      "SESSION_EXPIRING",
+      "관제 인증이 곧 만료됩니다. 다시 로그인해 주세요.",
+    );
+  }
+  const brokerName = await turnCredentialBrokerName(
+    request,
+    env.SESSION_SECRET,
+  );
+  const brokerId = env.LIVE_ROOM.idFromName(brokerName);
+  return env.LIVE_ROOM.get(brokerId).fetch(
+    new Request("https://safebot.internal/internal/turn-credentials", {
+      method: "POST",
+      headers: {
+        [TURN_MAX_EXPIRES_AT_HEADER]: String(maxExpiresAt),
+      },
+    }),
+  );
+}
+
 async function handleLiveSocket(request: Request, env: Env) {
   if (request.method !== "GET") return methodNotAllowed(["GET"]);
   assertLiveSocketOrigin(request);
@@ -1712,6 +1883,9 @@ async function handleApi(
     }
     if (url.pathname === "/api/auth/logout") {
       return await handleLogout(request);
+    }
+    if (url.pathname === "/api/live/ice-servers") {
+      return await handleLiveIceServers(request, env);
     }
     if (url.pathname === "/api/live/socket") {
       return await handleLiveSocket(request, env);
@@ -2176,9 +2350,17 @@ function findLivePeer(
  * and short-lived fallback JPEG frames; neither is written to storage.
  */
 export class LiveRoom {
-  constructor(private readonly state: DurableObjectState) {}
+  private turnCredentialsInFlight: Promise<TurnCredentialCache> | null = null;
+
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly env: Env,
+  ) {}
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === "/internal/turn-credentials") {
+      return this.handleTurnCredentialRequest(request);
+    }
     if (
       request.method !== "GET" ||
       request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
@@ -2270,6 +2452,234 @@ export class LiveRoom {
       maxViewers: MAX_LIVE_VIEWERS,
     });
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private async handleTurnCredentialRequest(request: Request) {
+    try {
+      if (request.method !== "POST") return methodNotAllowed(["POST"]);
+      const maxExpiresAt = Number(
+        request.headers.get(TURN_MAX_EXPIRES_AT_HEADER),
+      );
+      const now = Date.now();
+      if (
+        !Number.isInteger(maxExpiresAt) ||
+        maxExpiresAt - now <
+          (TURN_CREDENTIAL_MIN_TTL_SECONDS +
+            TURN_CREDENTIAL_EXPIRY_SAFETY_SECONDS) *
+            1000 ||
+        maxExpiresAt > now + TURN_CREDENTIAL_TTL_SECONDS * 1000 + 5_000
+      ) {
+        throw new ApiError(
+          401,
+          "SESSION_EXPIRING",
+          "관제 인증이 곧 만료됩니다. 다시 로그인해 주세요.",
+        );
+      }
+
+      const cached =
+        await this.state.storage.get<TurnCredentialCache>(
+          TURN_CACHE_STORAGE_KEY,
+        );
+      if (
+        cached &&
+        Number.isInteger(cached.expiresAt) &&
+        cached.expiresAt <= maxExpiresAt &&
+        cached.expiresAt - now > TURN_CREDENTIAL_REFRESH_MARGIN_MS &&
+        sanitizeCloudflareIceServers(cached.iceServers)
+      ) {
+        return turnCredentialResponse(cached);
+      }
+
+      if (!this.turnCredentialsInFlight) {
+        this.turnCredentialsInFlight = this.issueTurnCredentials(
+          maxExpiresAt,
+        ).finally(() => {
+          this.turnCredentialsInFlight = null;
+        });
+      }
+      const issued = await this.turnCredentialsInFlight;
+      if (issued.expiresAt > maxExpiresAt) {
+        throw new ApiError(
+          401,
+          "SESSION_EXPIRING",
+          "관제 인증이 곧 만료됩니다. 다시 로그인해 주세요.",
+        );
+      }
+      return turnCredentialResponse(issued);
+    } catch (error) {
+      if (error instanceof ApiError) return errorResponse(error);
+      return errorResponse(
+        new ApiError(
+          502,
+          "TURN_CREDENTIALS_UNAVAILABLE",
+          "원격 영상 중계 자격증명을 발급하지 못했습니다.",
+        ),
+      );
+    }
+  }
+
+  private async issueTurnCredentials(
+    maxExpiresAt: number,
+  ): Promise<TurnCredentialCache> {
+    const turnKeyId = this.env.TURN_KEY_ID?.trim() ?? "";
+    const turnApiToken = this.env.TURN_KEY_API_TOKEN?.trim() ?? "";
+    if (
+      !TURN_KEY_ID_PATTERN.test(turnKeyId) ||
+      !TURN_API_TOKEN_PATTERN.test(turnApiToken)
+    ) {
+      throw new ApiError(
+        503,
+        "TURN_NOT_CONFIGURED",
+        "원격 영상 중계가 아직 준비되지 않았습니다.",
+      );
+    }
+
+    const now = Date.now();
+    const ttlSeconds = Math.min(
+      TURN_CREDENTIAL_TTL_SECONDS,
+      Math.floor((maxExpiresAt - now) / 1000) -
+        TURN_CREDENTIAL_EXPIRY_SAFETY_SECONDS,
+    );
+    if (ttlSeconds < TURN_CREDENTIAL_MIN_TTL_SECONDS) {
+      throw new ApiError(
+        401,
+        "SESSION_EXPIRING",
+        "관제 인증이 곧 만료됩니다. 다시 로그인해 주세요.",
+      );
+    }
+
+    const storedRate =
+      await this.state.storage.get<TurnCredentialRateState>(
+        TURN_RATE_STORAGE_KEY,
+      );
+    const rate: TurnCredentialRateState =
+      storedRate &&
+      Number.isInteger(storedRate.windowStartedAt) &&
+      Number.isInteger(storedRate.attempts) &&
+      Number.isInteger(storedRate.lastFailureAt) &&
+      now - storedRate.windowStartedAt < TURN_PROVIDER_RATE_WINDOW_MS
+        ? storedRate
+        : {
+            windowStartedAt: now,
+            attempts: 0,
+            lastFailureAt: 0,
+          };
+    if (
+      rate.lastFailureAt > 0 &&
+      now - rate.lastFailureAt < TURN_PROVIDER_FAILURE_COOLDOWN_MS
+    ) {
+      const retryAfter = Math.ceil(
+        (TURN_PROVIDER_FAILURE_COOLDOWN_MS -
+          (now - rate.lastFailureAt)) /
+          1000,
+      );
+      throw new ApiError(
+        503,
+        "TURN_CREDENTIALS_COOLDOWN",
+        "원격 영상 중계를 잠시 후 다시 시도해 주세요.",
+        retryAfter,
+      );
+    }
+    if (rate.attempts >= TURN_PROVIDER_MAX_ATTEMPTS_PER_WINDOW) {
+      const retryAfter = Math.max(
+        1,
+        Math.ceil(
+          (TURN_PROVIDER_RATE_WINDOW_MS -
+            (now - rate.windowStartedAt)) /
+            1000,
+        ),
+      );
+      throw new ApiError(
+        429,
+        "TURN_CREDENTIALS_RATE_LIMIT",
+        "원격 영상 중계 발급 한도에 도달했습니다.",
+        retryAfter,
+      );
+    }
+    rate.attempts += 1;
+    await this.state.storage.put(TURN_RATE_STORAGE_KEY, rate);
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(turnKeyId)}/credentials/generate-ice-servers`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${turnApiToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ ttl: ttlSeconds }),
+          redirect: "error",
+          signal: AbortSignal.timeout(TURN_UPSTREAM_TIMEOUT_MS),
+        },
+      );
+    } catch {
+      rate.lastFailureAt = Date.now();
+      await this.state.storage.put(TURN_RATE_STORAGE_KEY, rate);
+      throw new ApiError(
+        502,
+        "TURN_CREDENTIALS_UNAVAILABLE",
+        "원격 영상 중계 서버에 연결하지 못했습니다.",
+      );
+    }
+    if (!upstream.ok) {
+      rate.lastFailureAt = Date.now();
+      await this.state.storage.put(TURN_RATE_STORAGE_KEY, rate);
+      throw new ApiError(
+        502,
+        "TURN_CREDENTIALS_UNAVAILABLE",
+        "원격 영상 중계 자격증명을 발급하지 못했습니다.",
+      );
+    }
+
+    const contentLength = Number(upstream.headers.get("Content-Length"));
+    if (
+      Number.isFinite(contentLength) &&
+      contentLength > MAX_TURN_RESPONSE_BYTES
+    ) {
+      rate.lastFailureAt = Date.now();
+      await this.state.storage.put(TURN_RATE_STORAGE_KEY, rate);
+      throw new ApiError(
+        502,
+        "TURN_CREDENTIALS_UNAVAILABLE",
+        "원격 영상 중계 응답이 허용 크기를 초과했습니다.",
+      );
+    }
+
+    let payload: unknown;
+    try {
+      const text = await upstream.text();
+      if (utf8Length(text) > MAX_TURN_RESPONSE_BYTES) {
+        throw new Error("TURN response too large");
+      }
+      payload = JSON.parse(text);
+    } catch {
+      payload = null;
+    }
+    const iceServers = isRecord(payload)
+      ? sanitizeCloudflareIceServers(payload.iceServers)
+      : null;
+    if (!iceServers) {
+      rate.lastFailureAt = Date.now();
+      await this.state.storage.put(TURN_RATE_STORAGE_KEY, rate);
+      throw new ApiError(
+        502,
+        "TURN_CREDENTIALS_UNAVAILABLE",
+        "원격 영상 중계 응답 형식이 올바르지 않습니다.",
+      );
+    }
+
+    rate.lastFailureAt = 0;
+    const cache: TurnCredentialCache = {
+      iceServers,
+      expiresAt: now + ttlSeconds * 1000,
+    };
+    await this.state.storage.put({
+      [TURN_CACHE_STORAGE_KEY]: cache,
+      [TURN_RATE_STORAGE_KEY]: rate,
+    });
+    return cache;
   }
 
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer) {

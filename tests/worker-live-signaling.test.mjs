@@ -20,6 +20,27 @@ function createContext() {
   };
 }
 
+function attachLiveRoomNamespace(env, LiveRoom) {
+  const rooms = new Map();
+  const requestedNames = [];
+  env.LIVE_ROOM = {
+    idFromName(name) {
+      requestedNames.push(name);
+      return { name };
+    },
+    get(id) {
+      if (!rooms.has(id.name)) {
+        rooms.set(
+          id.name,
+          new LiveRoom(new FakeDurableObjectState(), env),
+        );
+      }
+      return rooms.get(id.name);
+    },
+  };
+  return { rooms, requestedNames };
+}
+
 class FakeWebSocket {
   constructor(attachment) {
     this.attachment = structuredClone(attachment);
@@ -57,8 +78,23 @@ class FakeWebSocket {
 class FakeDurableObjectState {
   constructor(sockets = []) {
     this.sockets = sockets;
+    this.storageValues = new Map();
     this.storage = {
       alarm: null,
+      get: async (key) => structuredClone(this.storageValues.get(key)),
+      put: async (keyOrEntries, value) => {
+        if (
+          keyOrEntries &&
+          typeof keyOrEntries === "object" &&
+          !Array.isArray(keyOrEntries)
+        ) {
+          for (const [key, entry] of Object.entries(keyOrEntries)) {
+            this.storageValues.set(key, structuredClone(entry));
+          }
+          return;
+        }
+        this.storageValues.set(keyOrEntries, structuredClone(value));
+      },
       setAlarm: async (scheduledTime) => {
         this.storage.alarm =
           scheduledTime instanceof Date
@@ -258,6 +294,245 @@ test("authenticated upgrade overwrites the trusted expiry header and strips the 
   assert.equal(response.status, 204);
   assert.equal(forwardedExpiry, String(expiresAt * 1000));
   assert.equal(forwardedCookie, null);
+});
+
+test("TURN credentials require an authenticated same-origin request and configured secrets", async (t) => {
+  const { default: worker, LiveRoom } = await loadWorkerModule();
+  const sessionSecret = "test-session-secret-with-at-least-32-characters";
+  const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60;
+  let upstreamCalls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    upstreamCalls += 1;
+    throw new Error("should not be called");
+  });
+  const baseEnv = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    DB: {},
+    CONTROL_PASSWORD: "test-control-password",
+    SESSION_SECRET: sessionSecret,
+  };
+  attachLiveRoomNamespace(baseEnv, LiveRoom);
+
+  const unauthenticated = await worker.fetch(
+    new Request(`${origin}/api/live/ice-servers`, {
+      method: "POST",
+      headers: { origin },
+    }),
+    baseEnv,
+    createContext(),
+  );
+  assert.equal(unauthenticated.status, 401);
+  assert.equal((await unauthenticated.json()).error.code, "AUTH_REQUIRED");
+
+  const crossOrigin = await worker.fetch(
+    new Request(`${origin}/api/live/ice-servers`, {
+      method: "POST",
+      headers: {
+        cookie: signedSessionCookie(sessionSecret, expiresAt),
+        origin: "https://attacker.example",
+      },
+    }),
+    baseEnv,
+    createContext(),
+  );
+  assert.equal(crossOrigin.status, 403);
+  assert.equal((await crossOrigin.json()).error.code, "CROSS_ORIGIN_REQUEST");
+
+  const expiringSession = await worker.fetch(
+    new Request(`${origin}/api/live/ice-servers`, {
+      method: "POST",
+      headers: {
+        cookie: signedSessionCookie(
+          sessionSecret,
+          Math.floor(Date.now() / 1000) + 60,
+        ),
+        origin,
+      },
+    }),
+    baseEnv,
+    createContext(),
+  );
+  assert.equal(expiringSession.status, 401);
+  assert.equal(
+    (await expiringSession.json()).error.code,
+    "SESSION_EXPIRING",
+  );
+
+  const missingSecrets = await worker.fetch(
+    new Request(`${origin}/api/live/ice-servers`, {
+      method: "POST",
+      headers: {
+        cookie: signedSessionCookie(sessionSecret, expiresAt),
+        origin,
+      },
+    }),
+    baseEnv,
+    createContext(),
+  );
+  assert.equal(missingSecrets.status, 503);
+  assert.equal((await missingSecrets.json()).error.code, "TURN_NOT_CONFIGURED");
+  assert.equal(upstreamCalls, 0);
+});
+
+test("TURN credentials are short-lived, sanitized, and never expose the long-term key", async (t) => {
+  const { default: worker, LiveRoom } = await loadWorkerModule();
+  const sessionSecret = "test-session-secret-with-at-least-32-characters";
+  const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60;
+  const turnKeyId = "a".repeat(32);
+  const turnApiToken = "b".repeat(64);
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    calls.push({ url: String(url), options });
+    return new Response(
+      JSON.stringify({
+        iceServers: [
+          {
+            urls: [
+              "turn:turn.cloudflare.com:3478?transport=udp",
+              "turns:turn.cloudflare.com:443?transport=tcp",
+              "turn:turn.cloudflare.com:53?transport=udp",
+              "turn:evil.example:3478?transport=udp",
+            ],
+            username: "short-lived-user",
+            credential: "short-lived-credential",
+          },
+          {
+            urls: [
+              "stun:stun.cloudflare.com:3478",
+              "stun:stun.cloudflare.com:53",
+            ],
+          },
+        ],
+      }),
+      {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      },
+    );
+  });
+  const env = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    DB: {},
+    CONTROL_PASSWORD: "test-control-password",
+    SESSION_SECRET: sessionSecret,
+    TURN_KEY_ID: turnKeyId,
+    TURN_KEY_API_TOKEN: turnApiToken,
+  };
+  const broker = attachLiveRoomNamespace(env, LiveRoom);
+
+  const request = () =>
+    new Request(`${origin}/api/live/ice-servers`, {
+      method: "POST",
+      headers: {
+        cookie: signedSessionCookie(sessionSecret, expiresAt),
+        origin,
+      },
+    });
+  const response = await worker.fetch(
+    request(),
+    env,
+    createContext(),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    `https://rtc.live.cloudflare.com/v1/turn/keys/${turnKeyId}/credentials/generate-ice-servers`,
+  );
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(
+    calls[0].options.headers.Authorization,
+    `Bearer ${turnApiToken}`,
+  );
+  const issuedTtl = JSON.parse(calls[0].options.body).ttl;
+  assert.ok(issuedTtl >= 3_500 && issuedTtl <= 3_570);
+
+  const text = await response.text();
+  const body = JSON.parse(text);
+  assert.ok(body.expiresInSeconds >= 3_499);
+  assert.ok(body.expiresInSeconds <= issuedTtl);
+  assert.ok(body.expiresAt <= expiresAt * 1000);
+  assert.equal(body.profile.width, 480);
+  assert.equal(body.profile.height, 360);
+  assert.equal(body.profile.maxVideoBitrate, 350_000);
+  assert.equal(body.profile.frameRate, 12);
+  assert.equal(body.profile.audio, false);
+  assert.equal(body.profile.maxViewers, 3);
+  assert.deepEqual(body.iceServers, [
+    {
+      urls: [
+        "turn:turn.cloudflare.com:3478?transport=udp",
+        "turns:turn.cloudflare.com:443?transport=tcp",
+      ],
+      username: "short-lived-user",
+      credential: "short-lived-credential",
+    },
+    { urls: "stun:stun.cloudflare.com:3478" },
+  ]);
+  assert.doesNotMatch(text, new RegExp(turnApiToken, "u"));
+  assert.doesNotMatch(text, new RegExp(turnKeyId, "u"));
+
+  const cachedResponse = await worker.fetch(request(), env, createContext());
+  assert.equal(cachedResponse.status, 200);
+  assert.equal(calls.length, 1, "same session reuses one broker credential");
+  assert.equal(broker.requestedNames.length, 2);
+  assert.equal(new Set(broker.requestedNames).size, 1);
+});
+
+test("TURN credential provider failures are returned as sanitized gateway errors", async (t) => {
+  const { default: worker, LiveRoom } = await loadWorkerModule();
+  const sessionSecret = "test-session-secret-with-at-least-32-characters";
+  const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60;
+  let upstreamCalls = 0;
+  t.mock.method(
+    globalThis,
+    "fetch",
+    async () => {
+      upstreamCalls += 1;
+      return new Response(JSON.stringify({ error: "provider detail" }), {
+        status: 500,
+      });
+    },
+  );
+  const env = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    DB: {},
+    CONTROL_PASSWORD: "test-control-password",
+    SESSION_SECRET: sessionSecret,
+    TURN_KEY_ID: "a".repeat(32),
+    TURN_KEY_API_TOKEN: "b".repeat(64),
+  };
+  attachLiveRoomNamespace(env, LiveRoom);
+  const request = () =>
+    new Request(`${origin}/api/live/ice-servers`, {
+      method: "POST",
+      headers: {
+        cookie: signedSessionCookie(sessionSecret, expiresAt),
+        origin,
+      },
+    });
+  const response = await worker.fetch(
+    request(),
+    env,
+    createContext(),
+  );
+  assert.equal(response.status, 502);
+  const body = await response.json();
+  assert.equal(body.error.code, "TURN_CREDENTIALS_UNAVAILABLE");
+  assert.doesNotMatch(JSON.stringify(body), /provider detail/u);
+  const cooldownResponse = await worker.fetch(
+    request(),
+    env,
+    createContext(),
+  );
+  assert.equal(cooldownResponse.status, 503);
+  assert.equal(
+    (await cooldownResponse.json()).error.code,
+    "TURN_CREDENTIALS_COOLDOWN",
+  );
+  assert.equal(upstreamCalls, 1);
 });
 
 test("live room rejects oversized, unknown, and invalid-role text messages", async () => {
