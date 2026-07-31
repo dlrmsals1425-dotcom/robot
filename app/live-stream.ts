@@ -681,7 +681,7 @@ export class LiveBroadcastSender {
       !this.wanted ||
       this.socket !== socket ||
       this.peerRetryTimers.has(viewerId) ||
-      this.peers.get(viewerId)?.connection.connectionState === "connected"
+      this.peers.has(viewerId)
     ) {
       return;
     }
@@ -692,12 +692,10 @@ export class LiveBroadcastSender {
       () => {
         this.peerRetryTimers.delete(viewerId);
         if (!this.wanted || this.socket !== socket) return;
-        if (
-          this.peers.get(viewerId)?.connection.connectionState === "connected"
-        ) {
-          this.peerRetryAttempts.delete(viewerId);
-          return;
-        }
+        // A relay request can arrive while the original 15-second WebRTC
+        // negotiation is still healthy. Keep the 1fps relay alongside that
+        // attempt and let its own timeout/failure schedule a fresh offer.
+        if (this.peers.has(viewerId)) return;
         this.closePeer(viewerId);
         this.iceServersPromise = null;
         void this.createPeer(viewerId, socket);

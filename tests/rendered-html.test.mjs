@@ -236,6 +236,7 @@ test("ships authenticated low-bandwidth TURN live control with a relay fallback"
   assert.match(sender, /encoding\.maxFramerate = FRAME_RATE/);
   assert.doesNotMatch(sender, /encoding\.scaleResolutionDownBy/);
   assert.match(sender, /schedulePeerRetry/);
+  assert.match(sender, /this\.peers\.has\(viewerId\)/);
   assert.match(sender, /iceTransportPolicy: "all"/);
   assert.match(sender, /MAX_RECONNECT_ATTEMPTS = 6/);
   assert.match(sender, /RELAY_FRAME_WIDTH = 320/);
