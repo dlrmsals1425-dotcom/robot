@@ -1,4 +1,4 @@
-const CACHE_NAME = "safebot-shell-v4";
+const CACHE_NAME = "safebot-shell-v5";
 const APP_SHELL = ["/", "/manifest.webmanifest", "/icons/icon-192.png"];
 const STATIC_PREFIXES = [
   "/assets/",

@@ -88,7 +88,7 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   assert.match(serviceWorker, /notificationclick/);
   assert.match(serviceWorker, /showNotification/);
   assert.match(serviceWorker, /event\.request\.mode === "navigate"/);
-  assert.match(serviceWorker, /safebot-shell-v4/);
+  assert.match(serviceWorker, /safebot-shell-v5/);
   assert.match(serviceWorker, /requestUrl\.pathname\.startsWith\("\/api\/"\)/);
   assert.match(serviceWorker, /requestUrl\.pathname === "\/control"/);
   assert.match(page, /FaceDetector|blaze_face_full_range|얼굴/);
@@ -123,7 +123,14 @@ test("keeps safety alerts compact and person overlays red", async () => {
   assert.match(emergencyPanelRule, /width:\s*min\(410px/);
   assert.match(page, /const PERSON_DETECTION_COLOR = "#ff4d5a"/);
   assert.match(page, /const OBJECT_DETECTION_COLOR = "#7bd4ff"/);
+  assert.match(page, /fusePersonDetections/);
+  assert.match(page, /사람 · 자세 추적/);
+  assert.doesNotMatch(page, /drawBox\(box,\s*"사람",\s*1/);
   assert.match(page, /for \(const pose of result\.poses\)/);
+  assert.match(
+    await readFile(new URL("app/vision.worker.ts", templateRoot), "utf8"),
+    /deduplicatePoseDetections/,
+  );
   assert.match(page, /role="alertdialog"/);
   assert.match(fallDetection, /angleFromHorizontal < 30/);
   assert.match(fallDetection, /completeLeg/);
@@ -144,7 +151,14 @@ test("ships anonymized clip recording, bounded local storage, and private event 
   assert.match(page, /recordingCanvasRef/);
   assert.match(page, /startEventRecording/);
   assert.match(page, /original camera MediaStream is never recorded/);
-  assert.match(page, /drawFullyPixelatedFrame/);
+  assert.doesNotMatch(page, /drawFullyPixelatedFrame/);
+  assert.match(page, /fallbackPersonBoxes/);
+  assert.match(page, /claimedFaceRegions/);
+  assert.match(page, /calculatePoseHeadFallbackBox/);
+  assert.match(page, /expandedPersonPrivacyBox/);
+  assert.match(page, /PRIVACY_EMPTY_SCANS_REQUIRED = 2/);
+  assert.match(page, /PRIVACY_HOLD_MAX_MS/);
+  assert.match(page, /보호 확인 중/);
   assert.match(page, /eventUploadPromisesRef/);
   assert.doesNotMatch(page, /globalAlpha\s*=\s*0\.72/);
   assert.match(recorder, /EVENT_RECORDING_MAX_DURATION_MS = 10_000/);

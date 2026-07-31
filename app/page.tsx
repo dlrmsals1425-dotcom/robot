@@ -77,6 +77,13 @@ import {
   type LiveBroadcastSnapshot,
 } from "./live-stream";
 import {
+  calculatePoseHeadFallbackBox,
+  fusePersonDetections,
+  personBoxIou,
+  type PersonCountTrack,
+  updatePersonCountTrack,
+} from "./person-detection";
+import {
   decidePrivacyFrame,
   resolvePrivacyFrameMode,
   type PrivacyFrameDecision,
@@ -178,8 +185,12 @@ const RECOVERY_STABILITY_MS = 850;
 const LOST_TRACKING_MS = 1_100;
 const MAX_VERIFICATION_WALL_MS = 20_000;
 const PRIVACY_RESULT_MAX_AGE_MS = 650;
+const PRIVACY_HOLD_MAX_MS = 1_200;
+const PRIVACY_EMPTY_SCANS_REQUIRED = 2;
+const PERSON_COUNT_HOLD_MS = 1_050;
 const STORAGE_KEY = "safebot-safety-events-v1";
 const DEVICE_ID_KEY = "safebot-device-id-v1";
+const MIN_DISPLAY_PERSON_SCORE = 0.58;
 const PERSON_DETECTION_COLOR = "#ff4d5a";
 const OBJECT_DETECTION_COLOR = "#7bd4ff";
 
@@ -280,35 +291,6 @@ function poseFaceBox(
   return isUsableDetectionBox(box, frameWidth, frameHeight) ? box : null;
 }
 
-function poseBodyBox(
-  pose: PosePoint[],
-  frameWidth: number,
-  frameHeight: number,
-): DetectionBox | null {
-  const visiblePoints = pose.filter(
-    (point) =>
-      point.visibility > 0.45 &&
-      Number.isFinite(point.x) &&
-      Number.isFinite(point.y) &&
-      point.x >= 0 &&
-      point.x <= 1 &&
-      point.y >= 0 &&
-      point.y <= 1,
-  );
-  if (visiblePoints.length < 6) return null;
-  const xs = visiblePoints.map((point) => point.x * frameWidth);
-  const ys = visiblePoints.map((point) => point.y * frameHeight);
-  const minX = Math.min(...xs);
-  const minY = Math.min(...ys);
-  const box = {
-    originX: minX,
-    originY: minY,
-    width: Math.max(18, Math.max(...xs) - minX),
-    height: Math.max(22, Math.max(...ys) - minY),
-  };
-  return isUsableDetectionBox(box, frameWidth, frameHeight) ? box : null;
-}
-
 function boxCenterIsInside(
   inner: DetectionBox,
   outer: DetectionBox,
@@ -330,6 +312,34 @@ function boxCenterIsInside(
 
 function boxesDescribeSamePerson(a: DetectionBox, b: DetectionBox) {
   return boxCenterIsInside(a, b, 0.3) || boxCenterIsInside(b, a, 0.3);
+}
+
+function expandedPersonPrivacyBox(
+  box: DetectionBox,
+  frameWidth: number,
+  frameHeight: number,
+): DetectionBox {
+  const horizontal = Math.max(12, box.width * 0.22);
+  const above = Math.max(28, box.height * 0.38);
+  const below = Math.max(8, box.height * 0.1);
+  const left = clamp(box.originX - horizontal, 0, frameWidth);
+  const top = clamp(box.originY - above, 0, frameHeight);
+  const right = clamp(
+    box.originX + box.width + horizontal,
+    0,
+    frameWidth,
+  );
+  const bottom = clamp(
+    box.originY + box.height + below,
+    0,
+    frameHeight,
+  );
+  return {
+    originX: left,
+    originY: top,
+    width: Math.max(1, right - left),
+    height: Math.max(1, bottom - top),
+  };
 }
 
 function formatClipBytes(bytes?: number) {
@@ -399,6 +409,7 @@ export default function Home() {
     useState<BeforeInstallPromptEvent | null>(null);
   const [isStandalone, setIsStandalone] = useState(false);
   const [manualScenario, setManualScenario] = useState(false);
+  const [privacyFrameHeld, setPrivacyFrameHeld] = useState(false);
   const [recordingState, setRecordingState] =
     useState<ClipState>("none");
   const [controlConnection, setControlConnection] =
@@ -422,6 +433,9 @@ export default function Home() {
   const pixelCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const privacySourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const privacySanitizedCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const privacyHoldStartedRef = useRef<number | null>(null);
+  const privacyEmptyScanCountRef = useRef(0);
+  const personCountTrackRef = useRef<PersonCountTrack | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const workerReadyRef = useRef<Promise<void> | null>(null);
@@ -990,10 +1004,44 @@ export default function Home() {
     (result: VisionResult) => {
       latestResultRef.current = result;
 
-      const objectPeople = result.objects.filter(
-        (detection) => detection.categoryName === "person",
+      const uniquePeople = fusePersonDetections({
+        poses: result.poses,
+        objects: result.objects,
+        objectUpdated: result.objectUpdated,
+        frameWidth: result.frameWidth,
+        frameHeight: result.frameHeight,
+        objectOptions: { minScore: MIN_DISPLAY_PERSON_SCORE },
+      });
+      const currentFaceBoxes = result.faces
+        .map((face) => face.boundingBox)
+        .filter(
+          (box): box is DetectionBox =>
+            isUsableDetectionBox(
+              box,
+              result.frameWidth,
+              result.frameHeight,
+            ),
+        );
+      const currentFaces = currentFaceBoxes.filter(
+        (box, index, boxes) =>
+          boxes.findIndex(
+            (candidate) => personBoxIou(candidate, box) >= 0.55,
+          ) === index,
       ).length;
-      const people = Math.max(result.poses.length, objectPeople);
+      const nextPersonCountTrack = updatePersonCountTrack(
+        personCountTrackRef.current,
+        {
+          currentCount: Math.max(
+            uniquePeople.currentPeople,
+            currentFaces,
+          ),
+          objectUpdated: result.objectUpdated,
+          now: performance.now(),
+          holdMs: PERSON_COUNT_HOLD_MS,
+        },
+      );
+      personCountTrackRef.current = nextPersonCountTrack;
+      const people = nextPersonCountTrack.count;
       const nonPeople = result.objects.filter(
         (detection) => detection.categoryName !== "person",
       ).length;
@@ -1368,6 +1416,7 @@ export default function Home() {
       analysisWidth: number,
       analysisHeight: number,
       expansion = 0.3,
+      shape: "ellipse" | "rectangle" = "ellipse",
     ) => {
       const canvas = context.canvas;
       const scaleX = canvas.width / analysisWidth;
@@ -1412,67 +1461,25 @@ export default function Home() {
 
       context.save();
       context.beginPath();
-      context.ellipse(
-        x + width / 2,
-        y + height / 2,
-        width / 2,
-        height / 2,
-        0,
-        0,
-        Math.PI * 2,
-      );
+      if (shape === "rectangle") {
+        context.rect(x, y, width, height);
+      } else {
+        context.ellipse(
+          x + width / 2,
+          y + height / 2,
+          width / 2,
+          height / 2,
+          0,
+          0,
+          Math.PI * 2,
+        );
+      }
       context.clip();
       context.imageSmoothingEnabled = false;
       context.drawImage(pixelCanvas, x, y, width, height);
       context.restore();
       context.imageSmoothingEnabled = true;
       return true;
-    },
-    [],
-  );
-
-  const drawFullyPixelatedFrame = useCallback(
-    (
-      context: CanvasRenderingContext2D,
-      source: CanvasImageSource,
-    ) => {
-      const canvas = context.canvas;
-      const privacyWidth = 32;
-      const privacyHeight = Math.max(
-        18,
-        Math.round((canvas.height / canvas.width) * privacyWidth),
-      );
-      if (!pixelCanvasRef.current) {
-        pixelCanvasRef.current = document.createElement("canvas");
-      }
-      const privacyCanvas = pixelCanvasRef.current;
-      privacyCanvas.width = privacyWidth;
-      privacyCanvas.height = privacyHeight;
-      const privacyContext = privacyCanvas.getContext("2d");
-
-      context.save();
-      context.globalAlpha = 1;
-      context.fillStyle = "#07150f";
-      context.fillRect(0, 0, canvas.width, canvas.height);
-      if (privacyContext) {
-        privacyContext.drawImage(
-          source,
-          0,
-          0,
-          privacyCanvas.width,
-          privacyCanvas.height,
-        );
-        context.imageSmoothingEnabled = false;
-        context.drawImage(
-          privacyCanvas,
-          0,
-          0,
-          canvas.width,
-          canvas.height,
-        );
-      }
-      context.restore();
-      return Boolean(privacyContext);
     },
     [],
   );
@@ -1493,7 +1500,7 @@ export default function Home() {
       const drawBox = (
         box: DetectionBox,
         label: string,
-        score: number,
+        score: number | null,
         color: string,
       ) => {
         const x = clamp(box.originX * scaleX, 0, canvas.width);
@@ -1503,17 +1510,36 @@ export default function Home() {
         context.strokeStyle = color;
         context.fillStyle = color;
         context.strokeRect(x, y, boxWidth, boxHeight);
-        const text = `${label} ${Math.round(score * 100)}%`;
+        const text =
+          score === null ? label : `${label} ${Math.round(score * 100)}%`;
         const textWidth = context.measureText(text).width + 14;
         context.fillRect(x, Math.max(0, y - 27), textWidth, 27);
         context.fillStyle = "#07150f";
         context.fillText(text, x + 7, Math.max(2, y - 24));
       };
 
+      const uniquePeople = fusePersonDetections({
+        poses: result.poses,
+        objects: result.objects,
+        objectUpdated: result.objectUpdated,
+        frameWidth: result.frameWidth,
+        frameHeight: result.frameHeight,
+        objectOptions: { minScore: MIN_DISPLAY_PERSON_SCORE },
+      });
+      const currentObjectPersonIndexes = new Set(
+        uniquePeople.currentObjects.map(
+          (candidate) => candidate.detectionIndex,
+        ),
+      );
+      const currentObjectPersonBoxes = uniquePeople.currentObjects.map(
+        (candidate) => candidate.box,
+      );
+
       // Cached object boxes do not describe the exact analyzed frame. They are
       // omitted from clips/live until object detection was updated this frame.
       if (result.objectUpdated) {
-        for (const detection of result.objects.slice(0, 10)) {
+        for (const [detectionIndex, detection] of result.objects.entries()) {
+          if (detectionIndex >= 10) break;
           if (
             !isUsableDetectionBox(
               detection.boundingBox,
@@ -1524,6 +1550,9 @@ export default function Home() {
             continue;
           }
           const isPerson = detection.categoryName === "person";
+          if (isPerson && !currentObjectPersonIndexes.has(detectionIndex)) {
+            continue;
+          }
           drawBox(
             detection.boundingBox!,
             KOREAN_LABELS[detection.categoryName] ||
@@ -1537,20 +1566,18 @@ export default function Home() {
 
       // A current pose can still provide an exact red person box on frames
       // where the slower object detector was intentionally not refreshed.
-      if (
-        !result.objectUpdated ||
-        !result.objects.some(
-          (detection) =>
-            detection.categoryName === "person" &&
-            isUsableDetectionBox(
-              detection.boundingBox,
-              result.frameWidth,
-              result.frameHeight,
-            ),
-        )
-      ) {
-        for (const box of poseBoxes) {
-          drawBox(box, "사람", 1, PERSON_DETECTION_COLOR);
+      for (const box of poseBoxes) {
+        if (
+          !currentObjectPersonBoxes.some((objectBox) =>
+            boxesDescribeSamePerson(box, objectBox),
+          )
+        ) {
+          drawBox(
+            box,
+            "사람 · 자세 추적",
+            null,
+            PERSON_DETECTION_COLOR,
+          );
         }
       }
 
@@ -1573,6 +1600,8 @@ export default function Home() {
   );
 
   const writeOpaqueRecordingFrame = useCallback(() => {
+    privacyHoldStartedRef.current = null;
+    setPrivacyFrameHeld(true);
     const recordingCanvas = recordingCanvasRef.current;
     if (!recordingCanvas) return;
     const context = recordingCanvas.getContext("2d", { alpha: false });
@@ -1638,7 +1667,7 @@ export default function Home() {
       const faceDetections = result.faces.filter(
         (face) => face.categoryName === "face" || Boolean(face.boundingBox),
       );
-      const faceBoxes = faceDetections
+      const rawFaceBoxes = faceDetections
         .map((face) => face.boundingBox)
         .filter(
           (box): box is DetectionBox =>
@@ -1648,95 +1677,163 @@ export default function Home() {
               result.frameHeight,
             ),
         );
-      const poseFaceBoxes = result.poses
-        .map((pose) =>
-          poseFaceBox(pose, result.frameWidth, result.frameHeight),
-        )
-        .filter((box): box is DetectionBox => Boolean(box));
-      const poseBoxes = result.poses
-        .map((pose) =>
-          poseBodyBox(pose, result.frameWidth, result.frameHeight),
-        )
-        .filter((box): box is DetectionBox => Boolean(box));
-      const objectPeople = result.objects.filter(
-        (detection) => detection.categoryName === "person",
+      const faceBoxes = rawFaceBoxes.filter(
+        (box, index, boxes) =>
+          boxes.findIndex(
+            (candidate) => personBoxIou(candidate, box) >= 0.55,
+          ) === index,
       );
-      const objectPersonBoxes = objectPeople
-        .map((person) => person.boundingBox)
-        .filter(
-          (box): box is DetectionBox =>
-            isUsableDetectionBox(
-              box,
+      const poseFaceCandidates = result.poses
+        .map((pose, poseIndex) => ({
+          poseIndex,
+          box:
+            poseFaceBox(
+              pose,
+              result.frameWidth,
+              result.frameHeight,
+            ) ??
+            calculatePoseHeadFallbackBox(
+              pose,
               result.frameWidth,
               result.frameHeight,
             ),
+        }))
+        .filter(
+          (
+            candidate,
+          ): candidate is { poseIndex: number; box: DetectionBox } =>
+            Boolean(candidate.box),
         );
+      const poseFaceBoxes = poseFaceCandidates.map(
+        (candidate) => candidate.box,
+      );
+      const uniquePeople = fusePersonDetections({
+        poses: result.poses,
+        objects: result.objects,
+        objectUpdated: result.objectUpdated,
+        frameWidth: result.frameWidth,
+        frameHeight: result.frameHeight,
+      });
+      const poseBoxes = uniquePeople.poses.map(
+        (candidate) => candidate.box,
+      );
+      const personRegions = uniquePeople.people.map((person) => ({
+        box: person.box,
+        poseIndexes: person.poseIndexes,
+        objectDetectionIndexes: person.objectDetectionIndexes,
+        faceBoxIndexes: [] as number[],
+      }));
+      const claimedFaceRegions = new Set<number>();
 
-      let peopleSpatiallyAligned =
-        faceBoxes.length === faceDetections.length &&
-        poseBoxes.length === result.poses.length;
-      if (
-        peopleSpatiallyAligned &&
-        result.objectUpdated &&
-        objectPeople.length !== objectPersonBoxes.length
-      ) {
-        peopleSpatiallyAligned = false;
+      // Assign each distinct face to at most one person region. This avoids a
+      // single face mask incorrectly "protecting" two overlapping people.
+      for (const [faceIndex, faceBox] of faceBoxes.entries()) {
+        let matchingRegion = -1;
+        let smallestArea = Number.POSITIVE_INFINITY;
+        for (const [regionIndex, region] of personRegions.entries()) {
+          if (
+            claimedFaceRegions.has(regionIndex) ||
+            !boxCenterIsInside(faceBox, region.box, 0.3)
+          ) {
+            continue;
+          }
+          const area = region.box.width * region.box.height;
+          if (area < smallestArea) {
+            matchingRegion = regionIndex;
+            smallestArea = area;
+          }
+        }
+        if (matchingRegion >= 0) {
+          claimedFaceRegions.add(matchingRegion);
+          personRegions[matchingRegion].faceBoxIndexes.push(faceIndex);
+        } else {
+          personRegions.push({
+            box: faceBox,
+            poseIndexes: [],
+            objectDetectionIndexes: [],
+            faceBoxIndexes: [faceIndex],
+          });
+        }
       }
-      if (
-        peopleSpatiallyAligned &&
-        result.objectUpdated &&
-        poseBoxes.length === 1 &&
-        objectPersonBoxes.length === 1
-      ) {
-        peopleSpatiallyAligned = boxesDescribeSamePerson(
-          poseBoxes[0],
-          objectPersonBoxes[0],
+
+      const poseIndexesWithHeadMasks = new Set(
+        poseFaceCandidates.map((candidate) => candidate.poseIndex),
+      );
+      const regionHasHeadMask = (region: (typeof personRegions)[number]) =>
+        region.faceBoxIndexes.length > 0 ||
+        region.poseIndexes.some((poseIndex) =>
+          poseIndexesWithHeadMasks.has(poseIndex),
         );
-      }
-
-      const currentPersonRegions = [
-        ...poseBoxes,
-        ...(result.objectUpdated ? objectPersonBoxes : []),
-      ];
-      if (
-        peopleSpatiallyAligned &&
-        faceBoxes.length > 0 &&
-        currentPersonRegions.length > 0
-      ) {
-        peopleSpatiallyAligned = faceBoxes.every((faceBox) =>
-          currentPersonRegions.some((region) =>
-            boxCenterIsInside(faceBox, region, 0.3),
+      const fallbackPersonBoxes = personRegions
+        .filter(
+          (region) =>
+            !regionHasHeadMask(region) &&
+            region.objectDetectionIndexes.length > 0,
+        )
+        .map((region) =>
+          expandedPersonPrivacyBox(
+            region.box,
+            result.frameWidth,
+            result.frameHeight,
           ),
         );
-      }
-      if (
-        peopleSpatiallyAligned &&
-        result.objectUpdated &&
-        poseFaceBoxes.length === 1 &&
-        objectPersonBoxes.length === 1
-      ) {
-        peopleSpatiallyAligned = boxCenterIsInside(
-          poseFaceBoxes[0],
-          objectPersonBoxes[0],
-          0.3,
+      const currentPersonRegions = personRegions.map(
+        (region) => region.box,
+      );
+      const unprotectedPersonRegionCount = personRegions.filter(
+        (region) =>
+          !regionHasHeadMask(region) &&
+          region.objectDetectionIndexes.length === 0,
+      ).length;
+      const currentObjectPeople = result.objectUpdated
+        ? result.objects.filter(
+            (detection) =>
+              detection.categoryName === "person" &&
+              detection.score >= 0.45,
+          )
+        : [];
+      const peopleSpatiallyAligned =
+        rawFaceBoxes.length === faceDetections.length &&
+        poseBoxes.length === result.poses.length &&
+        currentObjectPeople.every((person) =>
+          isUsableDetectionBox(
+            person.boundingBox,
+            result.frameWidth,
+            result.frameHeight,
+          ),
         );
-      }
 
       const ageMs = performance.now() - result.timestamp;
+      const resultIsFresh =
+        Number.isFinite(ageMs) &&
+        ageMs >= 0 &&
+        ageMs <= PRIVACY_RESULT_MAX_AGE_MS;
+      if (currentPersonRegions.length > 0) {
+        privacyEmptyScanCountRef.current = 0;
+      } else if (
+        !resultIsFresh ||
+        !sanitizedContext ||
+        !peopleSpatiallyAligned
+      ) {
+        privacyEmptyScanCountRef.current = 0;
+      } else if (result.objectUpdated) {
+        privacyEmptyScanCountRef.current += 1;
+      }
+      const exactEmptySceneVerified =
+        result.objectUpdated &&
+        privacyEmptyScanCountRef.current >= PRIVACY_EMPTY_SCANS_REQUIRED;
       const decision: PrivacyFrameDecision = decidePrivacyFrame({
         sourceMatchesResult: true,
-        resultIsFresh:
-          Number.isFinite(ageMs) &&
-          ageMs >= 0 &&
-          ageMs <= PRIVACY_RESULT_MAX_AGE_MS,
+        resultIsFresh,
         sanitizedContextAvailable: Boolean(sanitizedContext),
-        posePersonCount: result.poses.length,
-        objectPersonCount: objectPeople.length,
-        faceMaskCount: faceBoxes.length,
-        poseFaceMaskCount: poseFaceBoxes.length,
+        currentPersonRegionCount: currentPersonRegions.length,
+        protectedPersonRegionCount:
+          currentPersonRegions.length - unprotectedPersonRegionCount,
         peopleSpatiallyAligned,
-        objectUpdated: result.objectUpdated,
-        objectFallbackAvailable: objectPersonBoxes.length === 1,
+        objectUpdated:
+          currentPersonRegions.length > 0
+            ? result.objectUpdated
+            : exactEmptySceneVerified,
       });
 
       if (!sanitizedContext) {
@@ -1759,7 +1856,6 @@ export default function Home() {
         try {
           sanitizedContext.drawImage(sourceCanvas, 0, 0);
           let maskSucceeded = true;
-          let appliedMasks = 0;
 
           for (const box of faceBoxes) {
             const applied = drawPixelatedRegion(
@@ -1771,7 +1867,6 @@ export default function Home() {
               0.34,
             );
             maskSucceeded = maskSucceeded && applied;
-            if (applied) appliedMasks += 1;
           }
           for (const box of poseFaceBoxes) {
             const applied = drawPixelatedRegion(
@@ -1783,28 +1878,26 @@ export default function Home() {
               0.55,
             );
             maskSucceeded = maskSucceeded && applied;
-            if (applied) appliedMasks += 1;
           }
-          if (decision.useObjectFallback) {
-            const personBox = objectPersonBoxes[0];
-            const headBox = {
-              originX: personBox.originX + personBox.width * 0.24,
-              originY: personBox.originY,
-              width: personBox.width * 0.52,
-              height: personBox.height * 0.28,
-            };
+          for (const personBox of fallbackPersonBoxes) {
             const applied = drawPixelatedRegion(
               sanitizedContext,
               sourceCanvas,
-              headBox,
+              personBox,
               result.frameWidth,
               result.frameHeight,
-              0.2,
+              0,
+              "rectangle",
             );
             maskSucceeded = maskSucceeded && applied;
-            if (applied) appliedMasks += 1;
           }
-          outputIsSafe = maskSucceeded && appliedMasks > 0;
+          outputIsSafe =
+            maskSucceeded &&
+            (currentPersonRegions.length === 0 ||
+              faceBoxes.length +
+                  poseFaceBoxes.length +
+                  fallbackPersonBoxes.length >
+                0);
         } catch {
           outputIsSafe = false;
         }
@@ -1814,25 +1907,27 @@ export default function Home() {
         decision,
         outputIsSafe,
       );
-      if (finalPrivacyMode === "pixelate") {
-        outputIsSafe = drawFullyPixelatedFrame(
-          sanitizedContext,
-          sourceCanvas,
-        );
-      } else if (finalPrivacyMode === "opaque") {
-        outputIsSafe = false;
+      if (finalPrivacyMode === "hold") {
+        sanitizedContext.restore();
+        setPrivacyFrameHeld(true);
+        const now = performance.now();
+        privacyHoldStartedRef.current ??= now;
+        if (now - privacyHoldStartedRef.current > PRIVACY_HOLD_MAX_MS) {
+          writeOpaqueRecordingFrame();
+        }
+        return true;
       }
-      if (!outputIsSafe) {
-        sanitizedContext.fillStyle = "#07150f";
-        sanitizedContext.fillRect(
-          0,
-          0,
-          sanitizedCanvas.width,
-          sanitizedCanvas.height,
-        );
-      } else {
-        drawPrivacyOverlays(sanitizedContext, result, poseBoxes);
+      if (finalPrivacyMode === "opaque" || !outputIsSafe) {
+        sanitizedContext.restore();
+        writeOpaqueRecordingFrame();
+        return true;
       }
+      privacyHoldStartedRef.current = null;
+      setPrivacyFrameHeld(false);
+      if (decision.reason === "verified_empty_scene") {
+        privacyEmptyScanCountRef.current = 0;
+      }
+      drawPrivacyOverlays(sanitizedContext, result, poseBoxes);
       sanitizedContext.restore();
 
       const recordingCanvas = recordingCanvasRef.current;
@@ -1875,7 +1970,6 @@ export default function Home() {
       return true;
     },
     [
-      drawFullyPixelatedFrame,
       drawPixelatedRegion,
       drawPrivacyOverlays,
       writeOpaqueRecordingFrame,
@@ -2012,6 +2106,8 @@ export default function Home() {
     pendingInferenceRef.current = null;
     privacySourceCanvasRef.current = null;
     privacySanitizedCanvasRef.current = null;
+    privacyEmptyScanCountRef.current = 0;
+    personCountTrackRef.current = null;
     pixelCanvasRef.current = null;
     latestResultRef.current = null;
 
@@ -2026,6 +2122,7 @@ export default function Home() {
       }
     }
     writeOpaqueRecordingFrame();
+    setPrivacyFrameHeld(false);
     const visibleCanvas = canvasRef.current;
     if (visibleCanvas) {
       const context = visibleCanvas.getContext("2d", { alpha: false });
@@ -2835,9 +2932,16 @@ export default function Home() {
                   {cameraState === "running" && (
                     <>
                       <div className="vision-top-overlay">
-                        <span className="ai-chip">
-                          <Sparkles size={13} aria-hidden="true" />
-                          AI LIVE
+                        <span
+                          className={`ai-chip ${privacyFrameHeld ? "held" : ""}`}
+                          role="status"
+                        >
+                          {privacyFrameHeld ? (
+                            <ShieldCheck size={13} aria-hidden="true" />
+                          ) : (
+                            <Sparkles size={13} aria-hidden="true" />
+                          )}
+                          {privacyFrameHeld ? "보호 확인 중" : "AI LIVE"}
                         </span>
                         <span className="privacy-chip">
                           <ShieldCheck size={13} aria-hidden="true" />

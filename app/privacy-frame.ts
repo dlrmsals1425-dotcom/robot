@@ -1,44 +1,64 @@
-export type PrivacyFrameMode = "sanitize" | "pixelate" | "opaque";
+export type PrivacyFrameMode = "sanitize" | "hold" | "opaque";
 
 export type PrivacyDecisionReason =
-  | "verified_single_person"
-  | "verified_single_face"
-  | "verified_object_head_fallback"
+  | "verified_people_protected"
+  | "verified_empty_scene"
   | "source_mismatch"
   | "stale_result"
   | "mask_context_unavailable"
-  | "count_mismatch"
-  | "multiple_people"
-  | "spatial_ambiguity"
-  | "no_confident_person"
-  | "stale_object_fallback"
-  | "missing_object_fallback";
+  | "person_region_mismatch"
+  | "object_result_pending"
+  | "unprotected_person_region";
 
 export type PrivacyDecisionInput = {
+  /**
+   * Whether the pixels available to the sanitizer are the exact pixels that
+   * produced this result. A mismatch is fatal because neither frame is safe to
+   * trust.
+   */
   sourceMatchesResult: boolean;
   resultIsFresh: boolean;
   sanitizedContextAvailable: boolean;
-  posePersonCount: number;
-  objectPersonCount?: number;
-  faceMaskCount: number;
-  poseFaceMaskCount: number;
+  /**
+   * Number of unique people regions in the current frame after pose, face and
+   * current object boxes have been spatially merged.
+   */
+  currentPersonRegionCount: number;
+  /**
+   * Number of unique current people regions for which the caller can render a
+   * face/head mask or a conservative per-person fallback.
+   */
+  protectedPersonRegionCount: number;
+  /**
+   * False when current detectors temporarily disagree about region count or
+   * position. Cached object results must not be treated as current regions.
+   */
   peopleSpatiallyAligned: boolean;
+  /**
+   * A zero-person frame is verified only when the slower object detector also
+   * ran on this exact frame. Protected people can be published without waiting
+   * for an object refresh.
+   */
   objectUpdated: boolean;
-  objectFallbackAvailable: boolean;
 };
 
 export type PrivacyFrameDecision = {
   mode: PrivacyFrameMode;
   reason: PrivacyDecisionReason;
-  useObjectFallback: boolean;
 };
+
+function isValidRegionCount(value: number) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
 
 /**
  * Fail-closed policy for frames that can leave the field device.
  *
- * Only one unambiguous person with a current face/head mask may use selective
- * redaction. Everything uncertain is reduced to a full-frame mosaic, while a
- * source/result mismatch never trusts the source and produces an opaque frame.
+ * Fatal source/context failures produce an opaque frame. Transient inference
+ * uncertainty holds the last completed safe frame. A current frame is
+ * publishable when every localized person region has a protection operation,
+ * regardless of how many people are present, or when all current detectors
+ * have verified an empty scene.
  */
 export function decidePrivacyFrame(
   input: PrivacyDecisionInput,
@@ -47,124 +67,79 @@ export function decidePrivacyFrame(
     return {
       mode: "opaque",
       reason: "source_mismatch",
-      useObjectFallback: false,
-    };
-  }
-  if (!input.resultIsFresh) {
-    return {
-      mode: "pixelate",
-      reason: "stale_result",
-      useObjectFallback: false,
     };
   }
   if (!input.sanitizedContextAvailable) {
     return {
       mode: "opaque",
       reason: "mask_context_unavailable",
-      useObjectFallback: false,
     };
   }
-
-  const posePeople = Math.max(0, input.posePersonCount);
-  const objectPeople =
-    input.objectPersonCount === undefined
-      ? undefined
-      : Math.max(0, input.objectPersonCount);
-  const faces = Math.max(0, input.faceMaskCount);
-  const poseFaces = Math.max(0, input.poseFaceMaskCount);
+  if (!input.resultIsFresh) {
+    return {
+      mode: "hold",
+      reason: "stale_result",
+    };
+  }
 
   if (
-    input.objectUpdated &&
-    objectPeople !== undefined &&
-    posePeople > 0 &&
-    objectPeople > 0 &&
-    posePeople !== objectPeople
+    !isValidRegionCount(input.currentPersonRegionCount) ||
+    !isValidRegionCount(input.protectedPersonRegionCount) ||
+    !input.peopleSpatiallyAligned
   ) {
     return {
-      mode: "pixelate",
-      reason: "count_mismatch",
-      useObjectFallback: false,
+      mode: "hold",
+      reason: "person_region_mismatch",
     };
   }
 
-  const detectedPeople = Math.max(
-    posePeople,
-    input.objectUpdated ? (objectPeople ?? 0) : 0,
-    faces,
-  );
-  if (
-    detectedPeople > 1 ||
-    faces > 1 ||
-    posePeople > 1 ||
-    (input.objectUpdated ? (objectPeople ?? 0) : 0) > 1
-  ) {
-    return {
-      mode: "pixelate",
-      reason: "multiple_people",
-      useObjectFallback: false,
-    };
-  }
+  const currentRegions = input.currentPersonRegionCount;
+  const protectedRegions = input.protectedPersonRegionCount;
 
-  if (!input.peopleSpatiallyAligned) {
-    return {
-      mode: "pixelate",
-      reason: "spatial_ambiguity",
-      useObjectFallback: false,
-    };
-  }
-
-  if (faces === 1) {
+  if (currentRegions === 0) {
+    if (protectedRegions !== 0) {
+      return {
+        mode: "hold",
+        reason: "person_region_mismatch",
+      };
+    }
+    if (!input.objectUpdated) {
+      return {
+        mode: "hold",
+        reason: "object_result_pending",
+      };
+    }
     return {
       mode: "sanitize",
-      reason: "verified_single_face",
-      useObjectFallback: false,
-    };
-  }
-  if (posePeople === 1 && poseFaces === 1) {
-    return {
-      mode: "sanitize",
-      reason: "verified_single_person",
-      useObjectFallback: false,
+      reason: "verified_empty_scene",
     };
   }
 
-  const needsObjectFallback =
-    (objectPeople ?? 0) === 1 &&
-    faces === 0 &&
-    poseFaces === 0;
-  if (needsObjectFallback && !input.objectUpdated) {
+  if (protectedRegions !== currentRegions) {
     return {
-      mode: "pixelate",
-      reason: "stale_object_fallback",
-      useObjectFallback: false,
-    };
-  }
-  if (needsObjectFallback && !input.objectFallbackAvailable) {
-    return {
-      mode: "pixelate",
-      reason: "missing_object_fallback",
-      useObjectFallback: false,
-    };
-  }
-  if (needsObjectFallback) {
-    return {
-      mode: "sanitize",
-      reason: "verified_object_head_fallback",
-      useObjectFallback: true,
+      mode: "hold",
+      reason:
+        protectedRegions < currentRegions
+          ? "unprotected_person_region"
+          : "person_region_mismatch",
     };
   }
 
   return {
-    mode: "pixelate",
-    reason: "no_confident_person",
-    useObjectFallback: false,
+    mode: "sanitize",
+    reason: "verified_people_protected",
   };
 }
 
+/**
+ * Converts a planned sanitization into the final publish mode. Mask or
+ * per-person fallback rendering failure is transient: keep the previous safe
+ * frame rather than replacing it with raw pixels or a full-frame mosaic.
+ */
 export function resolvePrivacyFrameMode(
   decision: PrivacyFrameDecision,
-  selectiveMaskRendered: boolean,
+  sanitizedFrameRendered: boolean,
 ): PrivacyFrameMode {
   if (decision.mode !== "sanitize") return decision.mode;
-  return selectiveMaskRendered ? "sanitize" : "pixelate";
+  return sanitizedFrameRendered ? "sanitize" : "hold";
 }

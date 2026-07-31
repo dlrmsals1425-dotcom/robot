@@ -651,6 +651,10 @@ a:focus-visible {
   color: var(--green-bright);
 }
 
+.ai-chip.held {
+  color: #ffd27a;
+}
+
 .privacy-chip {
   color: #cfe9db;
 }

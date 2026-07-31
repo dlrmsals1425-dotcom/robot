@@ -8,6 +8,7 @@ import {
   type Detection,
   type NormalizedLandmark,
 } from "@mediapipe/tasks-vision";
+import { deduplicatePoseDetections } from "./person-detection";
 
 type InitMessage = {
   type: "init";
@@ -140,6 +141,12 @@ function analyzeFrame(message: FrameMessage) {
   try {
     const poseResult = poseLandmarker.detectForVideo(frame, timestamp);
     const faceResult = faceDetector.detectForVideo(frame, timestamp);
+    const serializedPoses = serializePoses(poseResult.landmarks);
+    const uniquePoses = deduplicatePoseDetections(
+      serializedPoses,
+      frame.width,
+      frame.height,
+    ).map((candidate) => serializedPoses[candidate.poseIndex]);
     let objectUpdated = false;
 
     if (timestamp - lastObjectDetectionAt >= 850) {
@@ -154,7 +161,7 @@ function analyzeFrame(message: FrameMessage) {
       timestamp,
       frameWidth: frame.width,
       frameHeight: frame.height,
-      poses: serializePoses(poseResult.landmarks),
+      poses: uniquePoses,
       faces: serializeDetections(faceResult.detections),
       objects: cachedObjects,
       objectUpdated,

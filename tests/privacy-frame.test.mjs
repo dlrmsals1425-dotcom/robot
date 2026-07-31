@@ -6,104 +6,141 @@ import {
   resolvePrivacyFrameMode,
 } from "../app/privacy-frame.ts";
 
-const safeSinglePerson = {
+const protectedCurrentFrame = {
   sourceMatchesResult: true,
   resultIsFresh: true,
   sanitizedContextAvailable: true,
-  posePersonCount: 1,
-  objectPersonCount: 1,
-  faceMaskCount: 1,
-  poseFaceMaskCount: 1,
+  currentPersonRegionCount: 1,
+  protectedPersonRegionCount: 1,
   peopleSpatiallyAligned: true,
   objectUpdated: true,
-  objectFallbackAvailable: true,
 };
 
-test("selectively masks only one spatially consistent person", () => {
-  assert.deepEqual(decidePrivacyFrame(safeSinglePerson), {
-    mode: "sanitize",
-    reason: "verified_single_face",
-    useObjectFallback: false,
-  });
-});
-
-test("fully pixelates two people and person-count mismatches", () => {
-  assert.equal(
-    decidePrivacyFrame({
-      ...safeSinglePerson,
-      posePersonCount: 2,
-      objectPersonCount: 2,
-      faceMaskCount: 2,
-      poseFaceMaskCount: 2,
-    }).mode,
-    "pixelate",
-  );
-
-  const mismatch = decidePrivacyFrame({
-    ...safeSinglePerson,
-    posePersonCount: 2,
-    objectPersonCount: 1,
-    faceMaskCount: 1,
-    poseFaceMaskCount: 2,
-  });
-  assert.equal(mismatch.mode, "pixelate");
-  assert.equal(mismatch.reason, "count_mismatch");
-});
-
-test("uses an opaque frame for a source/result mismatch and mosaic for stale analysis", () => {
+test("sanitizes multiple people when every current region is protected", () => {
   assert.deepEqual(
     decidePrivacyFrame({
-      ...safeSinglePerson,
+      ...protectedCurrentFrame,
+      currentPersonRegionCount: 3,
+      protectedPersonRegionCount: 3,
+    }),
+    {
+      mode: "sanitize",
+      reason: "verified_people_protected",
+    },
+  );
+});
+
+test("treats one conservative per-person fallback as protected", () => {
+  assert.deepEqual(decidePrivacyFrame(protectedCurrentFrame), {
+    mode: "sanitize",
+    reason: "verified_people_protected",
+  });
+});
+
+test("holds the last safe frame for stale analysis", () => {
+  assert.deepEqual(
+    decidePrivacyFrame({
+      ...protectedCurrentFrame,
+      resultIsFresh: false,
+    }),
+    {
+      mode: "hold",
+      reason: "stale_result",
+    },
+  );
+});
+
+test("uses an opaque frame for a source/result mismatch", () => {
+  assert.deepEqual(
+    decidePrivacyFrame({
+      ...protectedCurrentFrame,
       sourceMatchesResult: false,
     }),
     {
       mode: "opaque",
       reason: "source_mismatch",
-      useObjectFallback: false,
     },
   );
-  assert.equal(
+});
+
+test("sanitizes an exactly verified empty scene", () => {
+  assert.deepEqual(
     decidePrivacyFrame({
-      ...safeSinglePerson,
-      resultIsFresh: false,
-    }).mode,
-    "pixelate",
+      ...protectedCurrentFrame,
+      currentPersonRegionCount: 0,
+      protectedPersonRegionCount: 0,
+      objectUpdated: true,
+    }),
+    {
+      mode: "sanitize",
+      reason: "verified_empty_scene",
+    },
   );
 });
 
-test("rejects a stale object result when the object head is the only fallback", () => {
-  const decision = decidePrivacyFrame({
-    ...safeSinglePerson,
-    posePersonCount: 0,
-    objectPersonCount: 1,
-    faceMaskCount: 0,
-    poseFaceMaskCount: 0,
-    objectUpdated: false,
-  });
-  assert.equal(decision.mode, "pixelate");
-  assert.equal(decision.reason, "stale_object_fallback");
+test("holds while the exact-frame object result needed for an empty scene is pending", () => {
+  assert.deepEqual(
+    decidePrivacyFrame({
+      ...protectedCurrentFrame,
+      currentPersonRegionCount: 0,
+      protectedPersonRegionCount: 0,
+      objectUpdated: false,
+    }),
+    {
+      mode: "hold",
+      reason: "object_result_pending",
+    },
+  );
 });
 
-test("fails closed when mask context or spatial validation fails", () => {
-  assert.equal(
+test("holds for transient region mismatch or an unprotected person", () => {
+  assert.deepEqual(
     decidePrivacyFrame({
-      ...safeSinglePerson,
-      sanitizedContextAvailable: false,
-    }).mode,
-    "opaque",
-  );
-  assert.equal(
-    decidePrivacyFrame({
-      ...safeSinglePerson,
+      ...protectedCurrentFrame,
+      currentPersonRegionCount: 2,
+      protectedPersonRegionCount: 2,
       peopleSpatiallyAligned: false,
-    }).mode,
-    "pixelate",
+    }),
+    {
+      mode: "hold",
+      reason: "person_region_mismatch",
+    },
   );
-  assert.equal(
-    resolvePrivacyFrameMode(
-      decidePrivacyFrame(safeSinglePerson),
-      false,
-    ),
-    "pixelate",
+
+  assert.deepEqual(
+    decidePrivacyFrame({
+      ...protectedCurrentFrame,
+      currentPersonRegionCount: 2,
+      protectedPersonRegionCount: 1,
+    }),
+    {
+      mode: "hold",
+      reason: "unprotected_person_region",
+    },
   );
+});
+
+test("uses an opaque frame when the initial sanitizer context is unavailable", () => {
+  assert.deepEqual(
+    decidePrivacyFrame({
+      ...protectedCurrentFrame,
+      sanitizedContextAvailable: false,
+    }),
+    {
+      mode: "opaque",
+      reason: "mask_context_unavailable",
+    },
+  );
+});
+
+test("holds after a selective mask or fallback rendering failure", () => {
+  const decision = decidePrivacyFrame(protectedCurrentFrame);
+  assert.equal(resolvePrivacyFrameMode(decision, false), "hold");
+  assert.equal(resolvePrivacyFrameMode(decision, true), "sanitize");
+
+  const fatalDecision = decidePrivacyFrame({
+    ...protectedCurrentFrame,
+    sourceMatchesResult: false,
+  });
+  assert.equal(resolvePrivacyFrameMode(fatalDecision, true), "opaque");
 });
