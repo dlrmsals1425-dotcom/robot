@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export type LiveViewerState = "connecting" | "live" | "offline";
+export type LiveViewerTransport = "webrtc" | "relay" | null;
 
 type SignalMessage = {
   type?: unknown;
@@ -28,6 +29,9 @@ const MAX_RECONNECT_ATTEMPTS = 8;
 const STABLE_SOCKET_MS = 30_000;
 const NEGOTIATION_TIMEOUT_MS = 15_000;
 const DISCONNECTED_TIMEOUT_MS = 8_000;
+const RELAY_REQUEST_DELAY_MS = 5_000;
+const RELAY_FRAME_STALL_MS = 4_000;
+const MAX_RELAY_FRAME_BYTES = 48 * 1024;
 
 function stringValue(value: unknown) {
   return typeof value === "string" ? value : "";
@@ -75,8 +79,11 @@ export function useLiveViewer(enabled: boolean) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const frameProgressTargetRef = useRef<FrameProgressTarget | null>(null);
+  const relayFrameUrlRef = useRef<string | null>(null);
   const [state, setState] = useState<LiveViewerState>("offline");
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [relayFrameUrl, setRelayFrameUrl] = useState<string | null>(null);
+  const [transport, setTransport] = useState<LiveViewerTransport>(null);
   const [restartToken, setRestartToken] = useState(0);
 
   const reconnect = useCallback(() => {
@@ -138,7 +145,7 @@ export function useLiveViewer(enabled: boolean) {
       if (pollingTimer !== null) window.clearInterval(pollingTimer);
       if (video.srcObject === remoteStream) video.srcObject = null;
     };
-  }, [remoteStream]);
+  }, [remoteStream, transport]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -152,9 +159,13 @@ export function useLiveViewer(enabled: boolean) {
     let negotiationTimer: number | null = null;
     let disconnectedTimer: number | null = null;
     let frameStallTimer: number | null = null;
+    let relayRequestTimer: number | null = null;
+    let relayStallTimer: number | null = null;
     let reconnectAttempt = 0;
     let broadcasterId = "";
     let pendingCandidates: RTCIceCandidateInit[] = [];
+    let relayRequested = false;
+    let webrtcReady = false;
 
     const clearTimer = (timer: number | null) => {
       if (timer !== null) window.clearTimeout(timer);
@@ -177,6 +188,15 @@ export function useLiveViewer(enabled: boolean) {
       updateRemoteStream(null);
     };
 
+    const clearRelayFrame = () => {
+      clearTimer(relayStallTimer);
+      relayStallTimer = null;
+      const previousUrl = relayFrameUrlRef.current;
+      relayFrameUrlRef.current = null;
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      if (!disposed) setRelayFrameUrl(null);
+    };
+
     const clearPeerTimers = () => {
       clearTimer(stabilityTimer);
       clearTimer(negotiationTimer);
@@ -190,6 +210,7 @@ export function useLiveViewer(enabled: boolean) {
 
     const closePeer = (nextState?: LiveViewerState) => {
       clearPeerTimers();
+      webrtcReady = false;
       frameProgressTargetRef.current = null;
       if (peer) {
         peer.onicecandidate = null;
@@ -200,7 +221,15 @@ export function useLiveViewer(enabled: boolean) {
       }
       pendingCandidates = [];
       clearVideo();
-      if (!disposed && nextState) setState(nextState);
+      if (!disposed && nextState) {
+        if (relayFrameUrlRef.current) {
+          setTransport("relay");
+          setState("live");
+        } else {
+          setTransport(null);
+          setState(nextState);
+        }
+      }
     };
 
     const send = (message: Record<string, unknown>) => {
@@ -212,6 +241,74 @@ export function useLiveViewer(enabled: boolean) {
       }
     };
 
+    const stopRelayFallback = () => {
+      clearTimer(relayRequestTimer);
+      relayRequestTimer = null;
+      if (relayRequested) send({ type: "relay-stop" });
+      relayRequested = false;
+      clearRelayFrame();
+    };
+
+    const requestRelayFallback = () => {
+      if (disposed || socket?.readyState !== WebSocket.OPEN) return;
+      clearTimer(relayRequestTimer);
+      relayRequestTimer = null;
+      if (!relayRequested) {
+        relayRequested = true;
+        send({ type: "relay-request" });
+      }
+      if (relayFrameUrlRef.current) {
+        setTransport("relay");
+        setState("live");
+      } else {
+        setState("connecting");
+      }
+    };
+
+    const handleRelayFrame = (buffer: ArrayBuffer) => {
+      const bytes = new Uint8Array(buffer);
+      if (
+        buffer.byteLength < 4 ||
+        buffer.byteLength > MAX_RELAY_FRAME_BYTES ||
+        bytes[0] !== 0xff ||
+        bytes[1] !== 0xd8 ||
+        bytes[2] !== 0xff ||
+        bytes[bytes.length - 2] !== 0xff ||
+        bytes[bytes.length - 1] !== 0xd9 ||
+        webrtcReady
+      ) {
+        return;
+      }
+
+      const nextUrl = URL.createObjectURL(
+        new Blob([buffer], { type: "image/jpeg" }),
+      );
+      const previousUrl = relayFrameUrlRef.current;
+      relayFrameUrlRef.current = nextUrl;
+      setRelayFrameUrl(nextUrl);
+      setTransport("relay");
+      setState("live");
+      reconnectAttempt = 0;
+      send({ type: "relay-ack" });
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+
+      clearTimer(relayStallTimer);
+      relayStallTimer = window.setTimeout(() => {
+        relayStallTimer = null;
+        if (disposed || relayFrameUrlRef.current !== nextUrl || webrtcReady) {
+          return;
+        }
+        clearRelayFrame();
+        setTransport(null);
+        setState("connecting");
+        if (relayRequested) {
+          send({ type: "relay-stop" });
+          relayRequested = false;
+        }
+        requestRelayFallback();
+      }, RELAY_FRAME_STALL_MS);
+    };
+
     const handleOffer = async (message: SignalMessage) => {
       const offer = sessionDescription(message.sdp, "offer");
       const target =
@@ -221,13 +318,23 @@ export function useLiveViewer(enabled: boolean) {
       if (!offer || !target || disposed) return;
 
       broadcasterId = target;
+      if (typeof RTCPeerConnection === "undefined") {
+        requestRelayFallback();
+        return;
+      }
       const queuedCandidates = pendingCandidates;
-      closePeer("connecting");
+      closePeer(relayFrameUrlRef.current ? "live" : "connecting");
       pendingCandidates = [];
 
-      const nextPeer = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }],
-      });
+      let nextPeer: RTCPeerConnection;
+      try {
+        nextPeer = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }],
+        });
+      } catch {
+        requestRelayFallback();
+        return;
+      }
       peer = nextPeer;
       let peerWasLive = false;
       let decodedFrameSeen = false;
@@ -235,8 +342,11 @@ export function useLiveViewer(enabled: boolean) {
 
       const reconnectPeer = (reason: string) => {
         if (disposed || peer !== nextPeer) return;
-        closePeer("offline");
-        socket?.close(4000, reason);
+        closePeer(relayFrameUrlRef.current ? "live" : "connecting");
+        requestRelayFallback();
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          socket?.close(4000, reason);
+        }
       };
 
       const startDisconnectedWatchdog = () => {
@@ -288,6 +398,7 @@ export function useLiveViewer(enabled: boolean) {
 
         const firstConnectedFrame = !peerWasLive;
         peerWasLive = true;
+        webrtcReady = true;
         clearTimer(negotiationTimer);
         clearTimer(disconnectedTimer);
         negotiationTimer = null;
@@ -307,6 +418,8 @@ export function useLiveViewer(enabled: boolean) {
             }
           }, STABLE_SOCKET_MS);
         }
+        stopRelayFallback();
+        setTransport("webrtc");
         setState("live");
         return true;
       };
@@ -320,7 +433,7 @@ export function useLiveViewer(enabled: boolean) {
 
       negotiationTimer = window.setTimeout(() => {
         negotiationTimer = null;
-        if (!markLiveIfReady()) reconnectPeer("negotiation timeout");
+        if (!markLiveIfReady()) requestRelayFallback();
       }, NEGOTIATION_TIMEOUT_MS);
 
       nextPeer.onicecandidate = (event) => {
@@ -397,13 +510,21 @@ export function useLiveViewer(enabled: boolean) {
         });
       } catch {
         if (peer === nextPeer) {
-          closePeer("offline");
-          socket?.close(4000, "peer retry");
+          closePeer(relayFrameUrlRef.current ? "live" : "connecting");
+          requestRelayFallback();
         }
       }
     };
 
     const handleMessage = async (data: unknown) => {
+      if (data instanceof ArrayBuffer) {
+        handleRelayFrame(data);
+        return;
+      }
+      if (typeof Blob !== "undefined" && data instanceof Blob) {
+        handleRelayFrame(await data.arrayBuffer());
+        return;
+      }
       if (typeof data !== "string") return;
       let message: SignalMessage;
       try {
@@ -433,6 +554,10 @@ export function useLiveViewer(enabled: boolean) {
 
       if (type === "peer-left" && message.role === "broadcaster") {
         broadcasterId = "";
+        relayRequested = false;
+        clearTimer(relayRequestTimer);
+        relayRequestTimer = null;
+        clearRelayFrame();
         closePeer("offline");
         return;
       }
@@ -468,9 +593,27 @@ export function useLiveViewer(enabled: boolean) {
             : Boolean(broadcasterId);
         if (!isOnline) {
           broadcasterId = "";
+          relayRequested = false;
+          clearTimer(relayRequestTimer);
+          relayRequestTimer = null;
+          clearRelayFrame();
           closePeer("offline");
-        } else if (!remoteStreamRef.current) {
+        } else if (
+          !remoteStreamRef.current &&
+          !relayFrameUrlRef.current
+        ) {
           setState("connecting");
+          if (typeof RTCPeerConnection === "undefined") {
+            requestRelayFallback();
+          } else if (
+            !relayRequested &&
+            relayRequestTimer === null
+          ) {
+            relayRequestTimer = window.setTimeout(
+              requestRelayFallback,
+              RELAY_REQUEST_DELAY_MS,
+            );
+          }
         }
       }
     };
@@ -498,6 +641,11 @@ export function useLiveViewer(enabled: boolean) {
       clearTimer(stabilityTimer);
       stabilityTimer = null;
       closePeer("connecting");
+      relayRequested = false;
+      clearTimer(relayRequestTimer);
+      relayRequestTimer = null;
+      clearRelayFrame();
+      setTransport(null);
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       let nextSocket: WebSocket;
@@ -510,6 +658,7 @@ export function useLiveViewer(enabled: boolean) {
         return;
       }
       socket = nextSocket;
+      nextSocket.binaryType = "arraybuffer";
 
       nextSocket.onopen = () => {
         if (disposed || socket !== nextSocket) return;
@@ -530,15 +679,16 @@ export function useLiveViewer(enabled: boolean) {
         socket = null;
         clearTimer(stabilityTimer);
         stabilityTimer = null;
+        relayRequested = false;
+        clearTimer(relayRequestTimer);
+        relayRequestTimer = null;
+        clearRelayFrame();
         closePeer("offline");
         if (event.code !== 4401) scheduleReconnect();
       };
     };
 
-    if (
-      typeof WebSocket === "undefined" ||
-      typeof RTCPeerConnection === "undefined"
-    ) {
+    if (typeof WebSocket === "undefined") {
       return;
     }
 
@@ -548,6 +698,8 @@ export function useLiveViewer(enabled: boolean) {
       disposed = true;
       clearTimer(reconnectTimer);
       clearTimer(stabilityTimer);
+      clearTimer(relayRequestTimer);
+      clearTimer(relayStallTimer);
       clearPeerTimers();
       reconnectTimer = null;
       stabilityTimer = null;
@@ -560,6 +712,9 @@ export function useLiveViewer(enabled: boolean) {
         socket = null;
       }
       pendingCandidates = [];
+      relayRequested = false;
+      relayRequestTimer = null;
+      clearRelayFrame();
       closePeer();
     };
   }, [enabled, restartToken]);
@@ -570,11 +725,13 @@ export function useLiveViewer(enabled: boolean) {
     hasStream:
       enabled &&
       state !== "offline" &&
-      remoteStream !== null,
+      (remoteStream !== null || relayFrameUrl !== null),
     isLive:
       enabled &&
       state === "live" &&
-      remoteStream !== null,
+      (remoteStream !== null || relayFrameUrl !== null),
+    transport: enabled ? transport : null,
+    relayFrameUrl: enabled ? relayFrameUrl : null,
     reconnect,
   };
 }

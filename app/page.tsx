@@ -473,6 +473,7 @@ export default function Home() {
   const eventsRef = useRef<SafetyEvent[]>([]);
   const deviceIdRef = useRef("모바일 순찰 01");
   const liveBroadcastSenderRef = useRef<LiveBroadcastSender | null>(null);
+  const pendingLiveBroadcastAfterLoginRef = useRef(false);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleVisionResultRef = useRef<(result: VisionResult) => void>(() => {});
   const publishPrivacyFrameRef = useRef<(result: VisionResult) => boolean>(
@@ -1239,6 +1240,7 @@ export default function Home() {
   }, [handleVisionResult]);
 
   const failClosedAfterVisionError = useCallback(() => {
+    pendingLiveBroadcastAfterLoginRef.current = false;
     pendingInferenceRef.current = null;
     workerBusyRef.current = false;
 
@@ -2154,6 +2156,7 @@ export default function Home() {
 
   const startLiveBroadcast = useCallback(() => {
     if (cameraState !== "running") {
+      pendingLiveBroadcastAfterLoginRef.current = false;
       setLiveBroadcast({
         state: "error",
         viewerCount: 0,
@@ -2163,16 +2166,19 @@ export default function Home() {
       return;
     }
     if (controlConnection !== "connected") {
+      pendingLiveBroadcastAfterLoginRef.current = true;
       setLiveBroadcast({
         state: "error",
         viewerCount: 0,
-        message: "관제센터에 연결한 뒤 실시간 공유를 시작할 수 있습니다.",
+        message:
+          "관제센터에 연결하면 로그인 직후 실시간 공유를 자동으로 시작합니다.",
       });
       setControlLoginError("");
       setShowControlLogin(true);
       return;
     }
 
+    pendingLiveBroadcastAfterLoginRef.current = false;
     const canvas = recordingCanvasRef.current;
     if (!canvas) {
       setLiveBroadcast({
@@ -2198,6 +2204,7 @@ export default function Home() {
 
   const stopCamera = useCallback(
     (reason?: "user" | "background") => {
+      pendingLiveBroadcastAfterLoginRef.current = false;
       stopLiveBroadcast();
       stopLoops();
       resetPrivacyFramePipeline();
@@ -2381,7 +2388,9 @@ export default function Home() {
         setControlConnection("connected");
         setShowControlLogin(false);
         showToast(
-          "관제센터에 연결했습니다. 실시간 공유를 직접 시작할 수 있습니다.",
+          pendingLiveBroadcastAfterLoginRef.current
+            ? "관제센터에 연결했습니다. 실시간 공유를 자동으로 시작합니다."
+            : "관제센터에 연결했습니다. 실시간 공유를 직접 시작할 수 있습니다.",
         );
         void syncPendingClips();
       } catch (error) {
@@ -2396,6 +2405,30 @@ export default function Home() {
     },
     [controlPassword, showToast, syncPendingClips],
   );
+
+  const cancelControlLogin = useCallback(() => {
+    pendingLiveBroadcastAfterLoginRef.current = false;
+    setShowControlLogin(false);
+  }, []);
+
+  useEffect(() => {
+    if (
+      !pendingLiveBroadcastAfterLoginRef.current ||
+      cameraState !== "running" ||
+      controlConnection !== "connected"
+    ) {
+      return;
+    }
+
+    // Start only after React has committed the authenticated state. Scheduling
+    // avoids calling a sender created from the pre-login render closure.
+    const startAfterAuthentication = window.setTimeout(() => {
+      if (!pendingLiveBroadcastAfterLoginRef.current) return;
+      setShowControlLogin(false);
+      startLiveBroadcast();
+    }, 0);
+    return () => window.clearTimeout(startAfterAuthentication);
+  }, [cameraState, controlConnection, startLiveBroadcast]);
 
   const openEventClip = useCallback(
     async (event: SafetyEvent) => {
@@ -2694,6 +2727,7 @@ export default function Home() {
             <button
               className="control-connect-button"
               onClick={() => {
+                pendingLiveBroadcastAfterLoginRef.current = false;
                 setControlLoginError("");
                 setShowControlLogin(true);
               }}
@@ -2786,35 +2820,38 @@ export default function Home() {
                       홈 화면에 추가
                     </button>
                   )}
-                  {cameraState === "running" &&
-                    controlConnection === "connected" && (
-                      <button
-                        className={`button ${
-                          liveBroadcastActive
-                            ? "button-danger-soft"
-                            : "button-primary"
-                        }`}
-                        onClick={
-                          liveBroadcastActive
-                            ? () => stopLiveBroadcast(true)
-                            : startLiveBroadcast
-                        }
-                        aria-label={
-                          liveBroadcastActive
-                            ? "관제센터 실시간 영상 공유 중지"
-                            : "익명화된 카메라 영상을 관제센터에 실시간 공유 시작"
-                        }
-                      >
-                        {liveBroadcastActive ? (
-                          <Pause size={17} aria-hidden="true" />
-                        ) : (
-                          <Radio size={17} aria-hidden="true" />
-                        )}
-                        {liveBroadcastActive
-                          ? "실시간 공유 중지"
-                          : "관제 실시간 공유"}
-                      </button>
-                    )}
+                  {cameraState === "running" && (
+                    <button
+                      className={`button ${
+                        liveBroadcastActive
+                          ? "button-danger-soft"
+                          : "button-primary"
+                      }`}
+                      onClick={
+                        liveBroadcastActive
+                          ? () => stopLiveBroadcast(true)
+                          : startLiveBroadcast
+                      }
+                      aria-label={
+                        liveBroadcastActive
+                          ? "관제센터 실시간 영상 공유 중지"
+                          : controlConnection === "connected"
+                            ? "익명화된 카메라 영상을 관제센터에 실시간 공유 시작"
+                            : "관제센터에 연결하고 익명화된 카메라 영상 실시간 공유 시작"
+                      }
+                    >
+                      {liveBroadcastActive ? (
+                        <Pause size={17} aria-hidden="true" />
+                      ) : (
+                        <Radio size={17} aria-hidden="true" />
+                      )}
+                      {liveBroadcastActive
+                        ? "실시간 공유 중지"
+                        : controlConnection === "connected"
+                          ? "관제 실시간 공유"
+                          : "연결 후 실시간 공유"}
+                    </button>
+                  )}
                   {cameraState === "running" ? (
                     <button
                       className="button button-danger-soft"
@@ -3571,16 +3608,20 @@ export default function Home() {
           role="presentation"
           onMouseDown={(event) => {
             if (event.currentTarget === event.target) {
-              setShowControlLogin(false);
+              cancelControlLogin();
             }
           }}
         >
           <form
             className="control-login-modal"
             onSubmit={connectToControl}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") cancelControlLogin();
+            }}
             role="dialog"
             aria-modal="true"
             aria-labelledby="device-control-login-title"
+            aria-describedby="device-control-login-description"
           >
             <div className="clip-modal-heading">
               <div>
@@ -3590,22 +3631,27 @@ export default function Home() {
               <button
                 className="icon-button"
                 type="button"
-                onClick={() => setShowControlLogin(false)}
+                onClick={cancelControlLogin}
                 aria-label="관제 연결 닫기"
               >
                 <X size={19} aria-hidden="true" />
               </button>
             </div>
-            <div className="control-login-description">
+            <div
+              id="device-control-login-description"
+              className="control-login-description"
+            >
               <span>
                 <UploadCloud size={21} aria-hidden="true" />
               </span>
               <div>
-                <strong>실시간 공유는 현장에서 직접 시작합니다</strong>
+                <strong>실시간 공유는 현장폰에서 제어합니다</strong>
                 <p>
                   원본과 음성은 전송하지 않습니다. 얼굴 흐림 처리가 끝난
                   실시간 화면만 공유하며, 확정된 10초 영상은 비공개 관제
-                  이력에 7일간 보관합니다.
+                  이력에 7일간 보관합니다. 실시간 공유 버튼에서 연결한
+                  경우에는 로그인 직후 공유가 자동으로 시작됩니다. 관제 연결
+                  버튼에서 직접 로그인한 경우에는 공유 버튼을 눌러 시작합니다.
                 </p>
               </div>
             </div>

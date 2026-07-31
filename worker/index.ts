@@ -107,6 +107,10 @@ type LiveSocketAttachment = {
   sessionExpiresAt: number;
   rateWindowStartedAt: number;
   rateWindowMessages: number;
+  relayRequested: boolean;
+  relayAwaitingAck: boolean;
+  relayAcknowledged: boolean;
+  lastRelayFrameAt: number;
 };
 
 type LiveRoomSnapshot = {
@@ -136,7 +140,13 @@ const MAX_LIVE_CONNECTIONS = MAX_LIVE_VIEWERS + 1;
 const MAX_SIGNAL_MESSAGE_BYTES = 64 * 1024;
 const MAX_SDP_BYTES = 48 * 1024;
 const MAX_ICE_CANDIDATE_BYTES = 4 * 1024;
-const MAX_SIGNAL_MESSAGES_PER_MINUTE = 240;
+const MAX_LIVE_MESSAGES_PER_MINUTE = 240;
+const MAX_RELAY_FRAME_BYTES = 48 * 1024;
+const MIN_RELAY_FRAME_INTERVAL_MS = 900;
+const MAX_RELAY_FRAME_WIDTH = 320;
+const MAX_RELAY_FRAME_HEIGHT = 640;
+const MAX_RELAY_FRAME_PIXELS =
+  MAX_RELAY_FRAME_WIDTH * MAX_RELAY_FRAME_HEIGHT;
 const LIVE_JOIN_TIMEOUT_MS = 15_000;
 const LIVE_PEER_ID_PATTERN = /^live-[0-9a-f-]{36}$/u;
 const MAX_MULTIPART_BYTES =
@@ -1776,7 +1786,13 @@ function readLiveAttachment(socket: WebSocket) {
     typeof value.rateWindowStartedAt !== "number" ||
     !Number.isFinite(value.rateWindowStartedAt) ||
     typeof value.rateWindowMessages !== "number" ||
-    !Number.isInteger(value.rateWindowMessages)
+    !Number.isInteger(value.rateWindowMessages) ||
+    typeof value.relayRequested !== "boolean" ||
+    typeof value.relayAwaitingAck !== "boolean" ||
+    typeof value.relayAcknowledged !== "boolean" ||
+    typeof value.lastRelayFrameAt !== "number" ||
+    !Number.isFinite(value.lastRelayFrameAt) ||
+    value.lastRelayFrameAt < 0
   ) {
     return null;
   }
@@ -1790,6 +1806,82 @@ function sendLiveMessage(socket: WebSocket, value: unknown) {
   } catch {
     // A peer can disconnect between readyState inspection and send().
   }
+}
+
+function sendLiveBinary(socket: WebSocket, value: ArrayBuffer) {
+  if (socket.readyState !== 1) return false;
+  try {
+    socket.send(value);
+    return true;
+  } catch {
+    // A peer can disconnect between readyState inspection and send().
+    return false;
+  }
+}
+
+function readRelayJpegDimensions(value: ArrayBuffer) {
+  const bytes = new Uint8Array(value);
+  let offset = 2;
+  let dimensions: { width: number; height: number } | null = null;
+  while (offset + 3 < bytes.length) {
+    if (bytes[offset] !== 0xff) return null;
+    while (offset < bytes.length && bytes[offset] === 0xff) offset += 1;
+    if (offset >= bytes.length) return null;
+    const marker = bytes[offset];
+    offset += 1;
+
+    if (
+      marker === 0xd8 ||
+      marker === 0x01 ||
+      (marker >= 0xd0 && marker <= 0xd7)
+    ) {
+      continue;
+    }
+    if (marker === 0xd9 || marker === 0xda) break;
+    if (offset + 1 >= bytes.length) return null;
+
+    const segmentLength = (bytes[offset] << 8) | bytes[offset + 1];
+    if (
+      segmentLength < 2 ||
+      offset + segmentLength > bytes.length
+    ) {
+      return null;
+    }
+
+    // Canvas JPEG output has no EXIF. Reject APP1 so a compromised sender
+    // cannot smuggle metadata or an embedded thumbnail through the fallback.
+    if (marker === 0xe1) return null;
+
+    const isStartOfFrame =
+      marker >= 0xc0 &&
+      marker <= 0xcf &&
+      marker !== 0xc4 &&
+      marker !== 0xc8 &&
+      marker !== 0xcc;
+    if (isStartOfFrame) {
+      if (
+        dimensions ||
+        segmentLength < 8 ||
+        bytes[offset + 2] !== 8
+      ) {
+        return null;
+      }
+      const height = (bytes[offset + 3] << 8) | bytes[offset + 4];
+      const width = (bytes[offset + 5] << 8) | bytes[offset + 6];
+      const components = bytes[offset + 7];
+      if (
+        width <= 0 ||
+        height <= 0 ||
+        components !== 3 ||
+        segmentLength !== 8 + components * 3
+      ) {
+        return null;
+      }
+      dimensions = { width, height };
+    }
+    offset += segmentLength;
+  }
+  return dimensions;
 }
 
 function closeLiveSocket(
@@ -1825,11 +1917,14 @@ function sendLiveError(
   });
 }
 
-function liveRoomSnapshot(state: DurableObjectState): LiveRoomSnapshot {
+function liveRoomSnapshot(
+  state: DurableObjectState,
+  excludedSocket?: WebSocket,
+): LiveRoomSnapshot {
   let broadcaster: LiveRoomSnapshot["broadcaster"] = null;
   const viewers: LiveRoomSnapshot["viewers"] = [];
   for (const socket of state.getWebSockets()) {
-    if (socket.readyState !== 1) continue;
+    if (socket === excludedSocket || socket.readyState !== 1) continue;
     const attachment = readLiveAttachment(socket);
     if (!attachment) continue;
     if (attachment.role === "broadcaster" && !broadcaster) {
@@ -1851,8 +1946,11 @@ function liveRoomStatus(snapshot: LiveRoomSnapshot) {
   };
 }
 
-function broadcastLiveRoomStatus(state: DurableObjectState) {
-  const snapshot = liveRoomSnapshot(state);
+function broadcastLiveRoomStatus(
+  state: DurableObjectState,
+  excludedSocket?: WebSocket,
+) {
+  const snapshot = liveRoomSnapshot(state, excludedSocket);
   const message = liveRoomStatus(snapshot);
   if (snapshot.broadcaster) {
     sendLiveMessage(snapshot.broadcaster.socket, message);
@@ -2024,6 +2122,21 @@ function parseLiveSignal(message: string) {
       }
       return { type: "status" as const, state: value.state };
     }
+    if (
+      value.type === "relay-request" ||
+      value.type === "relay-stop" ||
+      value.type === "relay-ack"
+    ) {
+      if (!hasExactKeys(value, ["type"])) {
+        throw new Error("invalid relay control");
+      }
+      return {
+        type: value.type as
+          | "relay-request"
+          | "relay-stop"
+          | "relay-ack",
+      };
+    }
   } catch {
     throw new ApiError(
       1008,
@@ -2060,7 +2173,7 @@ function findLivePeer(
 
 /**
  * A single hibernatable signaling room. It relays WebRTC negotiation metadata
- * only; SDP and ICE candidates are never written to Durable Object storage.
+ * and short-lived fallback JPEG frames; neither is written to storage.
  */
 export class LiveRoom {
   constructor(private readonly state: DurableObjectState) {}
@@ -2138,6 +2251,10 @@ export class LiveRoom {
       sessionExpiresAt,
       rateWindowStartedAt: now,
       rateWindowMessages: 0,
+      relayRequested: false,
+      relayAwaitingAck: false,
+      relayAcknowledged: false,
+      lastRelayFrameAt: 0,
     };
     server.serializeAttachment(attachment);
     this.state.acceptWebSocket(server);
@@ -2176,16 +2293,6 @@ export class LiveRoom {
       await this.scheduleNextSessionAlarm(socket);
       return;
     }
-    if (typeof message !== "string") {
-      closeLiveSocket(
-        socket,
-        1003,
-        "BINARY_SIGNAL_NOT_ALLOWED",
-        "문자 형식의 실시간 연결 메시지만 허용됩니다.",
-      );
-      return;
-    }
-
     const now = Date.now();
     if (now - attachment.rateWindowStartedAt >= 60_000) {
       attachment.rateWindowStartedAt = now;
@@ -2193,13 +2300,111 @@ export class LiveRoom {
     }
     attachment.rateWindowMessages += 1;
     socket.serializeAttachment(attachment);
-    if (attachment.rateWindowMessages > MAX_SIGNAL_MESSAGES_PER_MINUTE) {
+    if (attachment.rateWindowMessages > MAX_LIVE_MESSAGES_PER_MINUTE) {
       closeLiveSocket(
         socket,
         1008,
         "SIGNAL_RATE_LIMIT",
         "실시간 연결 메시지가 너무 많습니다.",
       );
+      return;
+    }
+
+    if (typeof message !== "string") {
+      if (attachment.role === "pending") {
+        closeLiveSocket(
+          socket,
+          1008,
+          "JOIN_REQUIRED",
+          "먼저 실시간 관제실 참여 메시지를 보내야 합니다.",
+        );
+        return;
+      }
+      if (attachment.role !== "broadcaster") {
+        closeLiveSocket(
+          socket,
+          1008,
+          "ROLE_NOT_ALLOWED",
+          "현장 송출자만 대체 영상 프레임을 보낼 수 있습니다.",
+        );
+        return;
+      }
+      if (message.byteLength > MAX_RELAY_FRAME_BYTES) {
+        closeLiveSocket(
+          socket,
+          1009,
+          "RELAY_FRAME_TOO_LARGE",
+          "대체 영상 프레임이 너무 큽니다.",
+        );
+        return;
+      }
+      const frameHeader = new Uint8Array(
+        message,
+        0,
+        Math.min(3, message.byteLength),
+      );
+      const frameTrailer =
+        message.byteLength >= 2
+          ? new Uint8Array(message, message.byteLength - 2, 2)
+          : new Uint8Array();
+      if (
+        frameHeader.length < 3 ||
+        frameHeader[0] !== 0xff ||
+        frameHeader[1] !== 0xd8 ||
+        frameHeader[2] !== 0xff ||
+        frameTrailer[0] !== 0xff ||
+        frameTrailer[1] !== 0xd9
+      ) {
+        closeLiveSocket(
+          socket,
+          1008,
+          "INVALID_RELAY_FRAME",
+          "대체 영상 프레임은 JPEG 형식이어야 합니다.",
+        );
+        return;
+      }
+      const dimensions = readRelayJpegDimensions(message);
+      if (
+        !dimensions ||
+        dimensions.width > MAX_RELAY_FRAME_WIDTH ||
+        dimensions.height > MAX_RELAY_FRAME_HEIGHT ||
+        dimensions.width * dimensions.height > MAX_RELAY_FRAME_PIXELS
+      ) {
+        closeLiveSocket(
+          socket,
+          1008,
+          "INVALID_RELAY_DIMENSIONS",
+          "대체 영상 프레임 해상도가 허용 범위를 벗어났습니다.",
+        );
+        return;
+      }
+      if (
+        attachment.lastRelayFrameAt > 0 &&
+        now - attachment.lastRelayFrameAt < MIN_RELAY_FRAME_INTERVAL_MS
+      ) {
+        // Mobile networks can release queued WebSocket frames in a burst even
+        // when the browser encoded them one second apart. Drop that frame
+        // without tearing down the authenticated broadcast; the combined
+        // per-socket limit above still closes sustained abuse.
+        return;
+      }
+
+      attachment.lastRelayFrameAt = now;
+      socket.serializeAttachment(attachment);
+      const snapshot = liveRoomSnapshot(this.state);
+      for (const viewer of snapshot.viewers) {
+        if (
+          viewer.state.relayRequested &&
+          !viewer.state.relayAwaitingAck
+        ) {
+          viewer.state.relayAwaitingAck = true;
+          viewer.socket.serializeAttachment(viewer.state);
+          if (!sendLiveBinary(viewer.socket, message)) {
+            viewer.state.relayAwaitingAck = false;
+            viewer.socket.serializeAttachment(viewer.state);
+          }
+        }
+      }
       return;
     }
 
@@ -2283,6 +2488,12 @@ export class LiveRoom {
             type: "viewer-joined",
             viewerId: viewer.state.peerId,
           });
+          if (viewer.state.relayRequested) {
+            sendLiveMessage(socket, {
+              type: "relay-request",
+              from: viewer.state.peerId,
+            });
+          }
         }
       }
       return;
@@ -2299,6 +2510,64 @@ export class LiveRoom {
     }
 
     const snapshot = liveRoomSnapshot(this.state);
+    if (
+      signal.type === "relay-request" ||
+      signal.type === "relay-stop" ||
+      signal.type === "relay-ack"
+    ) {
+      if (attachment.role !== "viewer") {
+        closeLiveSocket(
+          socket,
+          1008,
+          "ROLE_NOT_ALLOWED",
+          "관제 화면만 대체 영상 중계를 제어할 수 있습니다.",
+        );
+        return;
+      }
+      if (signal.type === "relay-ack") {
+        if (!attachment.relayRequested) {
+          closeLiveSocket(
+            socket,
+            1008,
+            "RELAY_NOT_REQUESTED",
+            "대체 영상 중계를 먼저 요청해야 합니다.",
+          );
+          return;
+        }
+        if (!attachment.relayAwaitingAck) {
+          closeLiveSocket(
+            socket,
+            1008,
+            "RELAY_ACK_NOT_PENDING",
+            "확인할 대체 영상 프레임이 없습니다.",
+          );
+          return;
+        }
+        attachment.relayAwaitingAck = false;
+        const firstAcknowledgement = !attachment.relayAcknowledged;
+        attachment.relayAcknowledged = true;
+        socket.serializeAttachment(attachment);
+        if (firstAcknowledgement && snapshot.broadcaster) {
+          sendLiveMessage(snapshot.broadcaster.socket, {
+            type: "relay-live",
+            from: attachment.peerId,
+          });
+        }
+        return;
+      }
+
+      attachment.relayRequested = signal.type === "relay-request";
+      attachment.relayAwaitingAck = false;
+      attachment.relayAcknowledged = false;
+      socket.serializeAttachment(attachment);
+      if (snapshot.broadcaster) {
+        sendLiveMessage(snapshot.broadcaster.socket, {
+          type: signal.type,
+          from: attachment.peerId,
+        });
+      }
+      return;
+    }
     if (signal.type === "offer") {
       if (attachment.role !== "broadcaster") {
         closeLiveSocket(
@@ -2438,11 +2707,19 @@ export class LiveRoom {
   private notifyPeerLeft(socket: WebSocket) {
     const attachment = readLiveAttachment(socket);
     if (!attachment || attachment.role === "pending") return;
-    const snapshot = liveRoomSnapshot(this.state);
+    const snapshot = liveRoomSnapshot(this.state, socket);
     const peers = [
       ...(snapshot.broadcaster ? [snapshot.broadcaster] : []),
       ...snapshot.viewers,
     ];
+    if (attachment.role === "broadcaster") {
+      for (const viewer of snapshot.viewers) {
+        viewer.state.relayRequested = false;
+        viewer.state.relayAwaitingAck = false;
+        viewer.state.relayAcknowledged = false;
+        viewer.socket.serializeAttachment(viewer.state);
+      }
+    }
     for (const peer of peers) {
       if (peer.state.peerId !== attachment.peerId) {
         sendLiveMessage(peer.socket, {
@@ -2452,7 +2729,7 @@ export class LiveRoom {
         });
       }
     }
-    broadcastLiveRoomStatus(this.state);
+    broadcastLiveRoomStatus(this.state, socket);
   }
 
   private async scheduleNextSessionAlarm(excludedSocket?: WebSocket) {

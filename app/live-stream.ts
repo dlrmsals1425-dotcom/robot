@@ -49,6 +49,12 @@ const STABLE_SIGNALING_MS = 30_000;
 const PEER_NEGOTIATION_TIMEOUT_MS = 15_000;
 const PEER_DISCONNECTED_TIMEOUT_MS = 8_000;
 const CLOUDFLARE_STUN_URL = "stun:stun.cloudflare.com:3478";
+const RELAY_FRAME_INTERVAL_MS = 1_000;
+const RELAY_FRAME_WIDTH = 320;
+const RELAY_FRAME_MAX_HEIGHT = 640;
+const MAX_RELAY_FRAME_BYTES = 48 * 1024;
+const RELAY_JPEG_QUALITY = 0.46;
+const RELAY_JPEG_RETRY_QUALITY = 0.3;
 
 export const IDLE_LIVE_BROADCAST: LiveBroadcastSnapshot = {
   state: "idle",
@@ -122,6 +128,11 @@ export class LiveBroadcastSender {
   private reconnectAttempts = 0;
   private wanted = false;
   private disposed = false;
+  private relayViewerIds = new Set<string>();
+  private confirmedRelayViewerIds = new Set<string>();
+  private relayCanvas: HTMLCanvasElement | null = null;
+  private relayTimer: number | null = null;
+  private relayEncoding = false;
   private lastSnapshot = IDLE_LIVE_BROADCAST;
 
   constructor({
@@ -139,8 +150,7 @@ export class LiveBroadcastSender {
 
     if (
       typeof WebSocket === "undefined" ||
-      typeof RTCPeerConnection === "undefined" ||
-      typeof this.canvas.captureStream !== "function"
+      typeof this.canvas.toBlob !== "function"
     ) {
       this.emit({
         state: "unsupported",
@@ -159,37 +169,39 @@ export class LiveBroadcastSender {
       return;
     }
 
-    let capturedStream: MediaStream | null = null;
-    try {
-      capturedStream = this.canvas.captureStream(FRAME_RATE);
-      // Canvas capture never contains audio. Stop defensively if a browser
-      // implementation ever returns an unexpected audio track.
-      capturedStream.getAudioTracks().forEach((track) => track.stop());
-      const track = capturedStream.getVideoTracks()[0];
-      if (!track) throw new Error("Missing canvas video track");
+    if (
+      typeof RTCPeerConnection !== "undefined" &&
+      typeof this.canvas.captureStream === "function"
+    ) {
+      let capturedStream: MediaStream | null = null;
       try {
-        track.contentHint = "motion";
+        capturedStream = this.canvas.captureStream(FRAME_RATE);
+        // Canvas capture never contains audio. Stop defensively if a browser
+        // implementation ever returns an unexpected audio track.
+        capturedStream.getAudioTracks().forEach((track) => track.stop());
+        const track = capturedStream.getVideoTracks()[0];
+        if (!track) throw new Error("Missing canvas video track");
+        try {
+          track.contentHint = "motion";
+        } catch {
+          // Older mobile browsers can expose the property but reject writes.
+        }
+        track.addEventListener(
+          "ended",
+          () => {
+            if (!this.wanted) return;
+            this.closeAllPeers();
+            this.emitLive();
+          },
+          { once: true },
+        );
+        this.stream = capturedStream;
       } catch {
-        // Older mobile browsers can expose the property but reject writes.
+        // WebRTC is an optimization. The authenticated, low-rate anonymized
+        // relay remains available on browsers where canvas capture fails.
+        capturedStream?.getTracks().forEach((track) => track.stop());
+        this.stream = null;
       }
-      track.addEventListener(
-        "ended",
-        () => {
-          if (this.wanted) {
-            this.fail("익명화 영상 트랙이 종료되어 공유를 중단했습니다.");
-          }
-        },
-        { once: true },
-      );
-      this.stream = capturedStream;
-    } catch {
-      capturedStream?.getTracks().forEach((track) => track.stop());
-      this.emit({
-        state: "unsupported",
-        viewerCount: 0,
-        message: "이 기기에서 익명화 화면을 공유할 수 없습니다.",
-      });
-      return;
     }
 
     this.wanted = true;
@@ -223,6 +235,7 @@ export class LiveBroadcastSender {
     }
 
     this.closeAllPeers();
+    this.clearRelayState();
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
     this.reconnectAttempts = 0;
@@ -281,6 +294,7 @@ export class LiveBroadcastSender {
       this.socket = null;
       this.clearStabilityTimer();
       this.closeAllPeers();
+      this.clearRelayState();
       if (!this.wanted) return;
 
       if (
@@ -318,6 +332,37 @@ export class LiveBroadcastSender {
 
   private async handleSignal(message: SignalMessage, socket: WebSocket) {
     const type = getString(message.type);
+
+    if (type === "relay-request") {
+      const viewerId = getViewerId(message);
+      if (viewerId) {
+        this.relayViewerIds.add(viewerId);
+        this.confirmedRelayViewerIds.delete(viewerId);
+        this.startRelayLoop();
+        this.emitLive();
+      }
+      return;
+    }
+
+    if (type === "relay-live") {
+      const viewerId = getViewerId(message);
+      if (viewerId && this.relayViewerIds.has(viewerId)) {
+        this.confirmedRelayViewerIds.add(viewerId);
+        this.emitLive();
+      }
+      return;
+    }
+
+    if (type === "relay-stop") {
+      const viewerId = getViewerId(message);
+      if (viewerId) {
+        this.relayViewerIds.delete(viewerId);
+        this.confirmedRelayViewerIds.delete(viewerId);
+        if (this.relayViewerIds.size === 0) this.clearRelayTimer();
+        this.emitLive();
+      }
+      return;
+    }
 
     if (type === "status") {
       const status = getString(message.status) ?? getString(message.state);
@@ -379,7 +424,12 @@ export class LiveBroadcastSender {
 
     if (type === "peer-left") {
       const peerId = getString(message.peerId);
-      if (peerId && message.role === "viewer") this.closePeer(peerId);
+      if (peerId && message.role === "viewer") {
+        this.relayViewerIds.delete(peerId);
+        this.confirmedRelayViewerIds.delete(peerId);
+        if (this.relayViewerIds.size === 0) this.clearRelayTimer();
+        this.closePeer(peerId);
+      }
       return;
     }
 
@@ -403,21 +453,26 @@ export class LiveBroadcastSender {
       !this.wanted ||
       this.socket !== socket ||
       this.peers.has(viewerId) ||
-      this.peers.size >= MAX_VIEWERS
+      this.peers.size >= MAX_VIEWERS ||
+      typeof RTCPeerConnection === "undefined"
     ) {
       return;
     }
 
     const track = this.stream?.getVideoTracks()[0];
-    if (!track || track.readyState !== "live") {
-      this.fail("익명화 영상이 준비되지 않아 공유를 종료했습니다.");
+    if (!track || track.readyState !== "live") return;
+
+    let connection: RTCPeerConnection;
+    try {
+      connection = new RTCPeerConnection({
+        iceServers: [{ urls: CLOUDFLARE_STUN_URL }],
+        bundlePolicy: "max-bundle",
+      });
+    } catch {
+      // The viewer can still request the authenticated JPEG fallback when a
+      // browser exposes RTCPeerConnection but cannot construct one.
       return;
     }
-
-    const connection = new RTCPeerConnection({
-      iceServers: [{ urls: CLOUDFLARE_STUN_URL }],
-      bundlePolicy: "max-bundle",
-    });
     const entry: PeerEntry = {
       connection,
       pendingCandidates: [],
@@ -595,11 +650,13 @@ export class LiveBroadcastSender {
   }
 
   private connectedViewerCount() {
-    let connected = 0;
-    for (const entry of this.peers.values()) {
-      if (entry.connection.connectionState === "connected") connected += 1;
+    const connected = new Set(this.confirmedRelayViewerIds);
+    for (const [viewerId, entry] of this.peers) {
+      if (entry.connection.connectionState === "connected") {
+        connected.add(viewerId);
+      }
     }
-    return connected;
+    return connected.size;
   }
 
   private emitLive() {
@@ -609,9 +666,129 @@ export class LiveBroadcastSender {
       viewerCount,
       message:
         viewerCount > 0
-          ? `관제 화면 ${viewerCount}곳에 익명화 영상을 공유 중입니다.`
+          ? this.confirmedRelayViewerIds.size > 0
+            ? `관제 화면 ${viewerCount}곳에 익명화 영상을 공유 중입니다. 일부 화면은 무료 저속 중계로 연결했습니다.`
+            : `관제 화면 ${viewerCount}곳에 익명화 영상을 공유 중입니다.`
+          : this.relayViewerIds.size > 0
+            ? "관제 화면과 무료 저속 중계를 연결하고 있습니다."
           : "실시간 공유 중 · 관제 화면 연결 대기",
     });
+  }
+
+  private startRelayLoop() {
+    if (
+      !this.wanted ||
+      this.disposed ||
+      this.relayViewerIds.size === 0 ||
+      this.relayEncoding ||
+      this.relayTimer !== null
+    ) {
+      return;
+    }
+    void this.sendRelayFrame();
+  }
+
+  private async sendRelayFrame() {
+    const socket = this.socket;
+    if (
+      !this.wanted ||
+      this.disposed ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN ||
+      this.relayViewerIds.size === 0 ||
+      this.relayEncoding
+    ) {
+      return;
+    }
+
+    this.relayEncoding = true;
+    const startedAt = Date.now();
+    try {
+      const relayCanvas = this.prepareRelayCanvas();
+      let frame = await this.encodeRelayJpeg(
+        relayCanvas,
+        RELAY_JPEG_QUALITY,
+      );
+      if (frame && frame.size > MAX_RELAY_FRAME_BYTES) {
+        frame = await this.encodeRelayJpeg(
+          relayCanvas,
+          RELAY_JPEG_RETRY_QUALITY,
+        );
+      }
+      if (
+        frame &&
+        frame.size <= MAX_RELAY_FRAME_BYTES &&
+        this.wanted &&
+        this.socket === socket &&
+        socket.readyState === WebSocket.OPEN &&
+        this.relayViewerIds.size > 0 &&
+        socket.bufferedAmount <= MAX_RELAY_FRAME_BYTES * 2
+      ) {
+        socket.send(await frame.arrayBuffer());
+      }
+    } catch {
+      // A single encode or send failure must not reveal the raw frame or stop
+      // the preferred WebRTC path. The next bounded relay tick can retry.
+    } finally {
+      this.relayEncoding = false;
+      if (
+        this.wanted &&
+        !this.disposed &&
+        this.relayViewerIds.size > 0 &&
+        this.socket?.readyState === WebSocket.OPEN
+      ) {
+        if (this.socket === socket) {
+          const elapsed = Date.now() - startedAt;
+          this.relayTimer = window.setTimeout(() => {
+            this.relayTimer = null;
+            void this.sendRelayFrame();
+          }, Math.max(0, RELAY_FRAME_INTERVAL_MS - elapsed));
+        } else {
+          // A reconnect may receive a new relay request while an encode from
+          // the old socket is still finishing. Kick the current socket once
+          // the shared encode lock is released.
+          this.startRelayLoop();
+        }
+      }
+    }
+  }
+
+  private prepareRelayCanvas() {
+    const scale = Math.min(
+      1,
+      RELAY_FRAME_WIDTH / this.canvas.width,
+      RELAY_FRAME_MAX_HEIGHT / this.canvas.height,
+    );
+    const width = Math.max(1, Math.round(this.canvas.width * scale));
+    const height = Math.max(1, Math.round(this.canvas.height * scale));
+    const relayCanvas =
+      this.relayCanvas ?? this.canvas.ownerDocument.createElement("canvas");
+    this.relayCanvas = relayCanvas;
+    if (relayCanvas.width !== width) relayCanvas.width = width;
+    if (relayCanvas.height !== height) relayCanvas.height = height;
+    const context = relayCanvas.getContext("2d", { alpha: false });
+    if (!context) throw new Error("Missing relay canvas context");
+    context.drawImage(this.canvas, 0, 0, width, height);
+    return relayCanvas;
+  }
+
+  private encodeRelayJpeg(canvas: HTMLCanvasElement, quality: number) {
+    return new Promise<Blob | null>((resolve) => {
+      canvas.toBlob(resolve, "image/jpeg", quality);
+    });
+  }
+
+  private clearRelayTimer() {
+    if (this.relayTimer !== null) {
+      window.clearTimeout(this.relayTimer);
+      this.relayTimer = null;
+    }
+  }
+
+  private clearRelayState() {
+    this.clearRelayTimer();
+    this.relayViewerIds.clear();
+    this.confirmedRelayViewerIds.clear();
   }
 
   private fail(message: string) {

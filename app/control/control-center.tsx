@@ -152,6 +152,8 @@ export default function ControlCenter() {
     state: liveViewerState,
     hasStream: hasLiveStream,
     isLive,
+    transport: liveTransport,
+    relayFrameUrl,
     reconnect: reconnectLiveViewer,
   } = useLiveViewer(authState === "signed_in");
 
@@ -287,7 +289,9 @@ export default function ControlCenter() {
   const latestEvent = events[0] ?? null;
   const liveStatusLabel =
     liveViewerState === "live"
-      ? "LIVE"
+      ? liveTransport === "relay"
+        ? "저속 RELAY · 1fps"
+        : "LIVE"
       : liveViewerState === "connecting"
         ? "실시간 연결 중"
         : "현장기기 오프라인";
@@ -516,7 +520,7 @@ export default function ControlCenter() {
                 >
                   <video
                     ref={liveVideoRef}
-                    controls
+                    controls={liveTransport !== "relay"}
                     autoPlay
                     muted
                     playsInline
@@ -526,8 +530,25 @@ export default function ControlCenter() {
                       width: "100%",
                       height: "100%",
                       objectFit: "cover",
+                      opacity: liveTransport === "relay" ? 0 : 1,
+                      pointerEvents:
+                        liveTransport === "relay" ? "none" : "auto",
                     }}
                   />
+                  {liveTransport === "relay" && relayFrameUrl && (
+                    // This short-lived blob URL contains only the anonymized
+                    // canvas frame relayed in memory; it is never persisted.
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={relayFrameUrl}
+                      alt="무료 저속 중계로 수신한 익명화 현장 화면"
+                      style={{
+                        position: "absolute",
+                        inset: 0,
+                        zIndex: 1,
+                      }}
+                    />
+                  )}
                   <span
                     className="control-play"
                     aria-hidden="true"
@@ -587,14 +608,18 @@ export default function ControlCenter() {
                 <div>
                   <strong>
                     {isLive
-                      ? "현장 실시간 영상 수신 중"
+                      ? liveTransport === "relay"
+                        ? "무료 저속 안전 중계 수신 중"
+                        : "현장 실시간 영상 수신 중"
                       : liveViewerState === "connecting"
                         ? "실시간 영상 연결 중"
                         : "현장기기 오프라인"}
                   </strong>
                   <p>
                     {isLive
-                      ? "WebRTC로 현장 영상을 실시간 수신합니다. 확정된 10초 사건 영상은 아래 이력에도 계속 보관됩니다."
+                      ? liveTransport === "relay"
+                        ? "직접 연결이 막힌 네트워크에서 익명화된 무음 화면만 초당 1장으로 임시 중계합니다. 중계 프레임은 서버에 저장하지 않습니다."
+                        : "WebRTC로 현장 영상을 실시간 수신합니다. 확정된 10초 사건 영상은 아래 이력에도 계속 보관됩니다."
                       : "실시간 영상이 없을 때는 가장 최근에 저장된 10초 사건 영상을 표시합니다."}
                   </p>
                   {!isLive && (
@@ -622,7 +647,9 @@ export default function ControlCenter() {
                 {isLive ? (
                   <span className="device-online">
                     <span />
-                    실시간 연결됨
+                    {liveTransport === "relay"
+                      ? "저속 중계 연결됨"
+                      : "실시간 연결됨"}
                   </span>
                 ) : (
                   <span className="control-status">{liveStatusLabel}</span>
