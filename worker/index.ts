@@ -2610,7 +2610,7 @@ export class LiveRoom {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ ttl: ttlSeconds }),
-          redirect: "error",
+          redirect: "manual",
           signal: AbortSignal.timeout(TURN_UPSTREAM_TIMEOUT_MS),
         },
       );

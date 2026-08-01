@@ -442,6 +442,7 @@ test("TURN credentials are short-lived, sanitized, and never expose the long-ter
     `https://rtc.live.cloudflare.com/v1/turn/keys/${turnKeyId}/credentials/generate-ice-servers`,
   );
   assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.redirect, "manual");
   assert.equal(
     calls[0].options.headers.Authorization,
     `Bearer ${turnApiToken}`,
