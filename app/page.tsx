@@ -193,6 +193,7 @@ const DEVICE_ID_KEY = "safebot-device-id-v1";
 const MIN_DISPLAY_PERSON_SCORE = 0.58;
 const PERSON_DETECTION_COLOR = "#ff4d5a";
 const OBJECT_DETECTION_COLOR = "#7bd4ff";
+const CANVAS_DARK_COLOR = "#07182d";
 
 const POSE_CONNECTIONS = [
   [11, 12],
@@ -584,15 +585,15 @@ export default function Home() {
         const registration = await navigator.serviceWorker.ready;
         await registration.showNotification("SAFEBOT · 쓰러짐 의심 알림", {
           body: "10초간 누운 자세가 지속되었습니다. 현장 확인이 필요합니다.",
-          icon: "/icons/icon-192.png",
-          badge: "/icons/icon-192.png",
+          icon: "/icons/icon-192-blue-v1.png",
+          badge: "/icons/icon-192-blue-v1.png",
           tag: "safebot-fall-alert",
           data: { url: "/?event=latest" },
         });
       } else {
         new Notification("SAFEBOT · 쓰러짐 의심 알림", {
           body: "10초간 누운 자세가 지속되었습니다. 현장 확인이 필요합니다.",
-          icon: "/icons/icon-192.png",
+          icon: "/icons/icon-192-blue-v1.png",
           tag: "safebot-fall-alert",
         });
       }
@@ -629,7 +630,7 @@ export default function Home() {
     }
     // Start from an opaque safe frame. The render loop replaces this only
     // with a verified redacted frame or full-frame pixelation.
-    context.fillStyle = "#07150f";
+    context.fillStyle = CANVAS_DARK_COLOR;
     context.fillRect(0, 0, target.width, target.height);
 
     try {
@@ -1273,7 +1274,7 @@ export default function Home() {
       alpha: false,
     });
     if (recordingCanvas && recordingContext) {
-      recordingContext.fillStyle = "#07150f";
+      recordingContext.fillStyle = CANVAS_DARK_COLOR;
       recordingContext.fillRect(
         0,
         0,
@@ -1359,7 +1360,7 @@ export default function Home() {
               alpha: false,
             });
             if (recordingCanvas && context) {
-              context.fillStyle = "#07150f";
+              context.fillStyle = CANVAS_DARK_COLOR;
               context.fillRect(
                 0,
                 0,
@@ -1516,7 +1517,7 @@ export default function Home() {
           score === null ? label : `${label} ${Math.round(score * 100)}%`;
         const textWidth = context.measureText(text).width + 14;
         context.fillRect(x, Math.max(0, y - 27), textWidth, 27);
-        context.fillStyle = "#07150f";
+        context.fillStyle = CANVAS_DARK_COLOR;
         context.fillText(text, x + 7, Math.max(2, y - 24));
       };
 
@@ -1610,7 +1611,7 @@ export default function Home() {
     if (!context) return;
     context.save();
     context.globalAlpha = 1;
-    context.fillStyle = "#07150f";
+    context.fillStyle = CANVAS_DARK_COLOR;
     context.fillRect(0, 0, recordingCanvas.width, recordingCanvas.height);
     context.restore();
   }, []);
@@ -1845,7 +1846,7 @@ export default function Home() {
 
       sanitizedContext.save();
       sanitizedContext.globalAlpha = 1;
-      sanitizedContext.fillStyle = "#07150f";
+      sanitizedContext.fillStyle = CANVAS_DARK_COLOR;
       sanitizedContext.fillRect(
         0,
         0,
@@ -1951,7 +1952,7 @@ export default function Home() {
       if (!recordingContext) return true;
       recordingContext.save();
       recordingContext.globalAlpha = 1;
-      recordingContext.fillStyle = "#07150f";
+      recordingContext.fillStyle = CANVAS_DARK_COLOR;
       recordingContext.fillRect(
         0,
         0,
@@ -1997,7 +1998,7 @@ export default function Home() {
 
     context.save();
     context.globalAlpha = 1;
-    context.fillStyle = "#07150f";
+    context.fillStyle = CANVAS_DARK_COLOR;
     context.fillRect(0, 0, canvas.width, canvas.height);
     try {
       // The phone display consumes the same completed privacy frame as clips
@@ -2119,7 +2120,7 @@ export default function Home() {
       analysisCanvas.height = 1;
       const context = analysisCanvas.getContext("2d", { alpha: false });
       if (context) {
-        context.fillStyle = "#07150f";
+        context.fillStyle = CANVAS_DARK_COLOR;
         context.fillRect(0, 0, 1, 1);
       }
     }
@@ -2129,7 +2130,7 @@ export default function Home() {
     if (visibleCanvas) {
       const context = visibleCanvas.getContext("2d", { alpha: false });
       if (context) {
-        context.fillStyle = "#07150f";
+        context.fillStyle = CANVAS_DARK_COLOR;
         context.fillRect(
           0,
           0,
@@ -2330,8 +2331,8 @@ export default function Home() {
           const registration = await navigator.serviceWorker.ready;
           await registration.showNotification("SAFEBOT 알림 준비 완료", {
             body: "10초 확인이 완료되면 이 기기에 안전 알림을 표시합니다.",
-            icon: "/icons/icon-192.png",
-            badge: "/icons/icon-192.png",
+            icon: "/icons/icon-192-blue-v1.png",
+            badge: "/icons/icon-192-blue-v1.png",
             tag: "safebot-ready",
           });
         }
@@ -2583,7 +2584,7 @@ export default function Home() {
       .catch(() => setControlConnection("unavailable"));
 
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => {
+      navigator.serviceWorker.register("/sw-blue-v1.js").catch(() => {
         // The core foreground camera experience remains available.
       });
     }
@@ -3096,7 +3097,7 @@ export default function Home() {
 
               <section className="metric-grid" aria-label="오늘의 순찰 현황">
                 <article className="metric-card">
-                  <div className="metric-icon green">
+                  <div className="metric-icon primary">
                     <UserRound size={19} aria-hidden="true" />
                   </div>
                   <div>

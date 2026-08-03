@@ -459,7 +459,7 @@ export default function ControlCenter() {
               </div>
             </article>
             <article>
-              <span className="control-metric-icon green">
+              <span className="control-metric-icon primary">
                 <History size={20} aria-hidden="true" />
               </span>
               <div>

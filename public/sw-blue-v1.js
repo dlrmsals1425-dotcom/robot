@@ -1,4 +1,4 @@
-const CACHE_NAME = "safebot-shell-v6";
+const CACHE_NAME = "safebot-shell-blue-v1";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest?theme=blue-v1",

@@ -18,7 +18,7 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   viewportFit: "cover",
-  themeColor: "#10221a",
+  themeColor: "#0b1f36",
 };
 
 export async function generateMetadata(): Promise<Metadata> {
@@ -34,7 +34,7 @@ export async function generateMetadata(): Promise<Metadata> {
     description:
       "사람과 사물을 감지하고 쓰러짐 의심 자세를 10초간 확인해 관제센터에 전달하는 고양 폴리봇 AI 관제 프로토타입",
     applicationName: "고양 폴리봇 SAFEBOT",
-    manifest: "/manifest.webmanifest",
+    manifest: "/manifest.webmanifest?theme=blue-v1",
     formatDetection: {
       telephone: false,
       address: false,
@@ -47,11 +47,19 @@ export async function generateMetadata(): Promise<Metadata> {
     },
     icons: {
       icon: [
-        { url: "/icons/icon-192.png", type: "image/png", sizes: "192x192" },
-        { url: "/icons/icon-512.png", type: "image/png", sizes: "512x512" },
+        {
+          url: "/icons/icon-192-blue-v1.png",
+          type: "image/png",
+          sizes: "192x192",
+        },
+        {
+          url: "/icons/icon-512-blue-v1.png",
+          type: "image/png",
+          sizes: "512x512",
+        },
       ],
-      shortcut: "/icons/icon-192.png",
-      apple: "/icons/icon-192.png",
+      shortcut: "/icons/icon-192-blue-v1.png",
+      apple: "/icons/icon-192-blue-v1.png",
     },
     openGraph: {
       type: "website",

@@ -63,8 +63,11 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   const requiredFiles = [
     "public/manifest.webmanifest",
     "public/sw.js",
+    "public/sw-blue-v1.js",
     "public/icons/icon-192.png",
     "public/icons/icon-512.png",
+    "public/icons/icon-192-blue-v1.png",
+    "public/icons/icon-512-blue-v1.png",
     "public/og.png",
     "public/og-goyang-polybot-v3.jpg",
     "public/branding/goyang-polybot-scene-v3.png",
@@ -82,7 +85,7 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   const [manifest, serviceWorker, page, visionWorker, packageJson, poseModel] =
     await Promise.all([
       readFile(new URL("public/manifest.webmanifest", templateRoot), "utf8"),
-      readFile(new URL("public/sw.js", templateRoot), "utf8"),
+      readFile(new URL("public/sw-blue-v1.js", templateRoot), "utf8"),
       readFile(new URL("app/page.tsx", templateRoot), "utf8"),
       readFile(new URL("app/vision.worker.ts", templateRoot), "utf8"),
       readFile(new URL("package.json", templateRoot), "utf8"),
@@ -93,7 +96,9 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   assert.match(serviceWorker, /notificationclick/);
   assert.match(serviceWorker, /showNotification/);
   assert.match(serviceWorker, /event\.request\.mode === "navigate"/);
-  assert.match(serviceWorker, /safebot-shell-v5/);
+  assert.match(serviceWorker, /safebot-shell-blue-v1/);
+  assert.match(serviceWorker, /icon-192-blue-v1\.png/);
+  assert.match(page, /serviceWorker\.register\("\/sw-blue-v1\.js"\)/);
   assert.match(serviceWorker, /requestUrl\.pathname\.startsWith\("\/api\/"\)/);
   assert.match(serviceWorker, /requestUrl\.pathname === "\/control"/);
   assert.match(page, /FaceDetector|blaze_face_full_range|얼굴/);
@@ -140,6 +145,37 @@ test("keeps safety alerts compact and person overlays red", async () => {
   assert.match(fallDetection, /angleFromHorizontal < 30/);
   assert.match(fallDetection, /completeLeg/);
   assert.match(fallDetection, /FALL_NEGATIVE_BUDGET_MS/);
+});
+
+test("uses a restrained blue-white product palette", async () => {
+  const [styles, layout, manifest, page, iconBuilder] = await Promise.all([
+    readFile(new URL("app/globals.css", templateRoot), "utf8"),
+    readFile(new URL("app/layout.tsx", templateRoot), "utf8"),
+    readFile(new URL("public/manifest.webmanifest", templateRoot), "utf8"),
+    readFile(new URL("app/page.tsx", templateRoot), "utf8"),
+    readFile(new URL("scripts/build-app-icons.mjs", templateRoot), "utf8"),
+  ]);
+
+  assert.match(styles, /--ink:\s*#102a43/);
+  assert.match(styles, /--paper:\s*#f5f8fc/);
+  assert.match(styles, /--primary:\s*#2563eb/);
+  assert.match(styles, /--primary-bright:\s*#60a5fa/);
+  assert.doesNotMatch(
+    styles,
+    /#0f7a4d|#b8f34a|#e8f7ee|rgb\(15 122 77|rgb\(184 243 74/,
+  );
+  assert.doesNotMatch(styles, /metric-icon\.green/);
+  assert.match(layout, /themeColor:\s*"#0b1f36"/);
+  assert.match(layout, /manifest:\s*"\/manifest\.webmanifest\?theme=blue-v1"/);
+  assert.match(manifest, /"background_color":\s*"#f5f8fc"/);
+  assert.match(manifest, /"theme_color":\s*"#0b1f36"/);
+  assert.match(manifest, /icon-192-blue-v1\.png/);
+  assert.match(manifest, /icon-512-blue-v1\.png/);
+  assert.match(page, /const CANVAS_DARK_COLOR = "#07182d"/);
+  assert.match(page, /const PERSON_DETECTION_COLOR = "#ff4d5a"/);
+  assert.match(iconBuilder, /#0b1f36/);
+  assert.match(iconBuilder, /#2563eb/);
+  assert.match(iconBuilder, /#60a5fa/);
 });
 
 test("ships anonymized clip recording, bounded local storage, and private event APIs", async () => {
