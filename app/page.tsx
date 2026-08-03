@@ -80,6 +80,7 @@ import {
   calculatePoseHeadFallbackBox,
   fusePersonDetections,
   personBoxIou,
+  selectConfirmedPersonPoses,
   type PersonCountTrack,
   updatePersonCountTrack,
 } from "./person-detection";
@@ -190,7 +191,9 @@ const PRIVACY_EMPTY_SCANS_REQUIRED = 2;
 const PERSON_COUNT_HOLD_MS = 1_050;
 const STORAGE_KEY = "safebot-safety-events-v1";
 const DEVICE_ID_KEY = "safebot-device-id-v1";
-const MIN_DISPLAY_PERSON_SCORE = 0.58;
+const MIN_DISPLAY_PERSON_SCORE = 0.62;
+const MIN_DISPLAY_FACE_SCORE = 0.65;
+const MIN_DISPLAY_OBJECT_SCORE = 0.55;
 const PERSON_DETECTION_COLOR = "#ff4d5a";
 const OBJECT_DETECTION_COLOR = "#7bd4ff";
 const CANVAS_DARK_COLOR = "#07182d";
@@ -1006,37 +1009,30 @@ export default function Home() {
     (result: VisionResult) => {
       latestResultRef.current = result;
 
-      const uniquePeople = fusePersonDetections({
+      const confirmedPoseCandidates = selectConfirmedPersonPoses({
         poses: result.poses,
+        objects: result.objects,
+        faces: result.faces,
+        frameWidth: result.frameWidth,
+        frameHeight: result.frameHeight,
+        minObjectScore: MIN_DISPLAY_PERSON_SCORE,
+        minFaceScore: MIN_DISPLAY_FACE_SCORE,
+      });
+      const confirmedPoses = confirmedPoseCandidates.map(
+        (candidate) => result.poses[candidate.poseIndex],
+      );
+      const uniquePeople = fusePersonDetections({
+        poses: confirmedPoses,
         objects: result.objects,
         objectUpdated: result.objectUpdated,
         frameWidth: result.frameWidth,
         frameHeight: result.frameHeight,
         objectOptions: { minScore: MIN_DISPLAY_PERSON_SCORE },
       });
-      const currentFaceBoxes = result.faces
-        .map((face) => face.boundingBox)
-        .filter(
-          (box): box is DetectionBox =>
-            isUsableDetectionBox(
-              box,
-              result.frameWidth,
-              result.frameHeight,
-            ),
-        );
-      const currentFaces = currentFaceBoxes.filter(
-        (box, index, boxes) =>
-          boxes.findIndex(
-            (candidate) => personBoxIou(candidate, box) >= 0.55,
-          ) === index,
-      ).length;
       const nextPersonCountTrack = updatePersonCountTrack(
         personCountTrackRef.current,
         {
-          currentCount: Math.max(
-            uniquePeople.currentPeople,
-            currentFaces,
-          ),
+          currentCount: uniquePeople.currentPeople,
           objectUpdated: result.objectUpdated,
           now: performance.now(),
           holdMs: PERSON_COUNT_HOLD_MS,
@@ -1045,19 +1041,25 @@ export default function Home() {
       personCountTrackRef.current = nextPersonCountTrack;
       const people = nextPersonCountTrack.count;
       const nonPeople = result.objects.filter(
-        (detection) => detection.categoryName !== "person",
+        (detection) =>
+          detection.categoryName !== "person" &&
+          detection.score >= MIN_DISPLAY_OBJECT_SCORE &&
+          isUsableDetectionBox(
+            detection.boundingBox,
+            result.frameWidth,
+            result.frameHeight,
+          ),
       ).length;
-      const analyses = result.poses.map(analyzeFallPose);
-      const emptyAnalysis: FallAnalysis = {
-        isLying: false,
-        isUpright: false,
-        confidence: 0,
-        center: null,
-      };
-      const strongestAnalysis = analyses.reduce<FallAnalysis>(
-        (best, current) =>
-          current.confidence > best.confidence ? current : best,
-        emptyAnalysis,
+      const analyses = confirmedPoseCandidates.map((candidate) =>
+        analyzeFallPose(
+          result.poses[candidate.poseIndex],
+          result.frameWidth,
+          result.frameHeight,
+          {
+            hasCorroboratingHumanEvidence:
+              candidate.confirmedByObject || candidate.confirmedByFace,
+          },
+        ),
       );
       const strongestLying = analyses
         .filter((analysis) => analysis.isLying && analysis.center)
@@ -1100,8 +1102,7 @@ export default function Home() {
       const nextVisionStats = {
         people,
         objects: nonPeople,
-        confidence:
-          strongestLying?.confidence ?? strongestAnalysis.confidence,
+        confidence: strongestLying?.confidence ?? 0,
         latencyMs: result.latencyMs,
       };
       visionStatsRef.current = nextVisionStats;
@@ -1488,11 +1489,7 @@ export default function Home() {
   );
 
   const drawPrivacyOverlays = useCallback(
-    (
-      context: CanvasRenderingContext2D,
-      result: VisionResult,
-      poseBoxes: DetectionBox[],
-    ) => {
+    (context: CanvasRenderingContext2D, result: VisionResult) => {
       const canvas = context.canvas;
       const scaleX = canvas.width / result.frameWidth;
       const scaleY = canvas.height / result.frameHeight;
@@ -1521,8 +1518,23 @@ export default function Home() {
         context.fillText(text, x + 7, Math.max(2, y - 24));
       };
 
-      const uniquePeople = fusePersonDetections({
+      const confirmedPoseCandidates = selectConfirmedPersonPoses({
         poses: result.poses,
+        objects: result.objects,
+        faces: result.faces,
+        frameWidth: result.frameWidth,
+        frameHeight: result.frameHeight,
+        minObjectScore: MIN_DISPLAY_PERSON_SCORE,
+        minFaceScore: MIN_DISPLAY_FACE_SCORE,
+      });
+      const confirmedPoses = confirmedPoseCandidates.map(
+        (candidate) => result.poses[candidate.poseIndex],
+      );
+      const poseBoxes = confirmedPoseCandidates.map(
+        (candidate) => candidate.box,
+      );
+      const uniquePeople = fusePersonDetections({
+        poses: confirmedPoses,
         objects: result.objects,
         objectUpdated: result.objectUpdated,
         frameWidth: result.frameWidth,
@@ -1556,6 +1568,9 @@ export default function Home() {
           if (isPerson && !currentObjectPersonIndexes.has(detectionIndex)) {
             continue;
           }
+          if (!isPerson && detection.score < MIN_DISPLAY_OBJECT_SCORE) {
+            continue;
+          }
           drawBox(
             detection.boundingBox!,
             KOREAN_LABELS[detection.categoryName] ||
@@ -1584,7 +1599,7 @@ export default function Home() {
         }
       }
 
-      for (const pose of result.poses) {
+      for (const pose of confirmedPoses) {
         context.strokeStyle = PERSON_DETECTION_COLOR;
         context.fillStyle = PERSON_DETECTION_COLOR;
         context.lineWidth = Math.max(2.5, canvas.width / 360);
@@ -1930,7 +1945,7 @@ export default function Home() {
       if (decision.reason === "verified_empty_scene") {
         privacyEmptyScanCountRef.current = 0;
       }
-      drawPrivacyOverlays(sanitizedContext, result, poseBoxes);
+      drawPrivacyOverlays(sanitizedContext, result);
       sanitizedContext.restore();
 
       const recordingCanvas = recordingCanvasRef.current;

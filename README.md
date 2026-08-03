@@ -35,7 +35,8 @@ TURN 설정이나 연결에 문제가 생기면 같은 인증 WebSocket이 익�
 
 ## 현재 구현 범위
 
-- MediaPipe Pose Landmarker를 이용한 사람 자세 분석
+- MediaPipe Pose Landmarker Full과 인체 관절 구조 검증을 이용한 자세 분석
+- 사람 객체·얼굴·자세의 교차 확인으로 관제 표시와 쓰러짐 오탐 억제
 - MediaPipe Object Detector를 이용한 사람·일반 사물 감지
 - MediaPipe Face Detector와 자세·사람 영역 폴백을 이용한 얼굴 픽셀화
 - 10초 연속 확인, 10초 이내 회복, 오탐 취소, 추적 중단 상태
@@ -191,7 +192,8 @@ Realtime의 무료 포함량을 사용합니다. Realtime은 매월 첫 1,000GB�
 
 모델과 WASM 런타임을 `public/` 아래에 고정해 런타임 CDN 버전 변경에 영향을 받지 않도록 했습니다.
 
-- `pose_landmarker_lite.task`
+- `pose_landmarker_full.task` (현재 관제 정확도 우선 모델)
+- `pose_landmarker_lite.task` (저사양 기기 비교용 보관 모델)
 - `blaze_face_full_range.tflite`
 - `efficientdet_lite0_uint8.tflite`
 - `@mediapipe/tasks-vision` WASM 런타임

@@ -6,6 +6,7 @@ import {
   createVerificationProgress,
   updateVerificationProgress,
 } from "../app/fall-detection.ts";
+import { analyzePoseHumanEvidence } from "../app/person-detection.ts";
 
 function emptyPose() {
   return Array.from({ length: 33 }, () => ({
@@ -39,8 +40,15 @@ function makeStandingPose() {
 
 function makeLyingPose(y = 0.7) {
   const pose = emptyPose();
+  setPoint(pose, 0, 0.14, y - 0.01);
+  setPoint(pose, 7, 0.17, y - 0.035);
+  setPoint(pose, 8, 0.17, y + 0.025);
   setPoint(pose, 11, 0.22, y - 0.02);
   setPoint(pose, 12, 0.28, y - 0.02);
+  setPoint(pose, 13, 0.31, y - 0.09);
+  setPoint(pose, 14, 0.36, y + 0.06);
+  setPoint(pose, 15, 0.4, y - 0.1);
+  setPoint(pose, 16, 0.45, y + 0.07);
   setPoint(pose, 23, 0.48, y);
   setPoint(pose, 24, 0.54, y);
   setPoint(pose, 25, 0.66, y + 0.01);
@@ -54,16 +62,41 @@ function makeLyingPose(y = 0.7) {
   return pose;
 }
 
+function makePixelInvariantLyingPose(frameWidth, frameHeight, rotation = 0) {
+  const sourceWidth = 640;
+  const sourceHeight = 480;
+  const source = makeLyingPose();
+  const sourceCenter = { x: 0.51 * sourceWidth, y: 0.7 * sourceHeight };
+  const targetCenter = { x: frameWidth * 0.5, y: frameHeight * 0.7 };
+  const scale = (Math.min(frameWidth, frameHeight) / sourceHeight) * 0.62;
+  const radians = (rotation * Math.PI) / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+
+  return source.map((point) => {
+    if (point.visibility <= 0) return point;
+    const sourceX = point.x * sourceWidth - sourceCenter.x;
+    const sourceY = point.y * sourceHeight - sourceCenter.y;
+    const targetX = (sourceX * cosine - sourceY * sine) * scale;
+    const targetY = (sourceX * sine + sourceY * cosine) * scale;
+    return {
+      ...point,
+      x: (targetCenter.x + targetX) / frameWidth,
+      y: (targetCenter.y + targetY) / frameHeight,
+    };
+  });
+}
+
 test("accepts a complete horizontal body near the ground", () => {
-  const result = analyzeFallPose(makeLyingPose());
+  const result = analyzeFallPose(makeLyingPose(), 640, 480);
   assert.equal(result.isLying, true);
   assert.equal(result.isUpright, false);
-  assert.ok(result.confidence >= 0.7);
+  assert.ok(result.confidence >= 0.78);
 
   const noisyOppositeLeg = makeLyingPose();
   setPoint(noisyOppositeLeg, 26, 1.4, 0.1);
   setPoint(noisyOppositeLeg, 28, 1.6, 0.05);
-  assert.equal(analyzeFallPose(noisyOppositeLeg).isLying, true);
+  assert.equal(analyzeFallPose(noisyOppositeLeg, 640, 480).isLying, false);
 });
 
 test("rejects standing, seated, partial, high, and clipped poses", () => {
@@ -87,14 +120,88 @@ test("rejects standing, seated, partial, high, and clipped poses", () => {
     clipped[index].x = -0.08;
   }
 
-  const standing = analyzeFallPose(makeStandingPose());
+  const standing = analyzeFallPose(makeStandingPose(), 640, 480);
   assert.equal(standing.isLying, false);
   assert.equal(standing.isUpright, true);
-  assert.equal(analyzeFallPose(seated).isLying, false);
-  assert.equal(analyzeFallPose(partial).isLying, false);
-  assert.equal(analyzeFallPose(partial).isUpright, false);
-  assert.equal(analyzeFallPose(makeLyingPose(0.36)).isLying, false);
-  assert.equal(analyzeFallPose(clipped).isLying, false);
+  assert.equal(analyzeFallPose(seated, 640, 480).isLying, false);
+  assert.equal(analyzeFallPose(partial, 640, 480).isLying, false);
+  assert.equal(analyzeFallPose(partial, 640, 480).isUpright, false);
+  assert.equal(analyzeFallPose(makeLyingPose(0.36), 640, 480).isLying, false);
+  assert.equal(analyzeFallPose(clipped, 640, 480).isLying, false);
+});
+
+test("rejects a confident horizontal tabletop skeleton without full anatomy", () => {
+  const pose = emptyPose();
+  setPoint(pose, 11, 0.18, 0.58, 0.98);
+  setPoint(pose, 12, 0.36, 0.57, 0.97);
+  setPoint(pose, 23, 0.47, 0.6, 0.98);
+  setPoint(pose, 24, 0.64, 0.59, 0.97);
+  setPoint(pose, 25, 0.62, 0.61, 0.96);
+  setPoint(pose, 27, 0.86, 0.62, 0.96);
+
+  const result = analyzeFallPose(pose, 640, 480);
+  assert.equal(result.isLying, false);
+  assert.equal(result.isUpright, false);
+  assert.ok(result.confidence < 0.78);
+});
+
+test("accepts an occluded lying pose only with corroborating human evidence", () => {
+  const pose = makeLyingPose();
+  for (const index of [0, 7, 8, 14, 16, 26, 28, 30, 32]) {
+    pose[index].visibility = 0.2;
+  }
+
+  const poseOnly = analyzeFallPose(pose, 640, 480);
+  const corroborated = analyzeFallPose(pose, 640, 480, {
+    hasCorroboratingHumanEvidence: true,
+  });
+  assert.equal(poseOnly.isLying, false);
+  assert.equal(corroborated.isLying, true);
+  assert.ok(corroborated.confidence >= 0.78);
+});
+
+test("keeps pixel-space fall decisions consistent across phone orientations", () => {
+  const portraitSize = [720, 1280];
+  const landscapeSize = [1280, 720];
+  const portraitPose = makePixelInvariantLyingPose(...portraitSize);
+  const landscapePose = makePixelInvariantLyingPose(...landscapeSize);
+  const portraitEvidence = analyzePoseHumanEvidence(
+    portraitPose,
+    ...portraitSize,
+  );
+  const landscapeEvidence = analyzePoseHumanEvidence(
+    landscapePose,
+    ...landscapeSize,
+  );
+  const portrait = analyzeFallPose(portraitPose, ...portraitSize);
+  const landscape = analyzeFallPose(landscapePose, ...landscapeSize);
+
+  assert.equal(portraitEvidence.isStrong, true);
+  assert.equal(landscapeEvidence.isStrong, true);
+  assert.equal(portrait.isLying, true);
+  assert.equal(landscape.isLying, true);
+  assert.ok(Math.abs(portraitEvidence.score - landscapeEvidence.score) < 0.01);
+  assert.ok(Math.abs(portrait.confidence - landscape.confidence) < 0.03);
+});
+
+test("uses pixel-corrected torso angles at the fall boundary", () => {
+  for (const [width, height] of [
+    [720, 1280],
+    [1280, 720],
+  ]) {
+    const likelyFall = analyzeFallPose(
+      makePixelInvariantLyingPose(width, height, 20),
+      width,
+      height,
+    );
+    const angledBody = analyzeFallPose(
+      makePixelInvariantLyingPose(width, height, 32),
+      width,
+      height,
+    );
+    assert.equal(likelyFall.isLying, true);
+    assert.equal(angledBody.isLying, false);
+  }
 });
 
 test("counts a continuous positive sequence to ten seconds", () => {

@@ -24,6 +24,34 @@ export type PosePersonCandidate = {
   quality: number;
 };
 
+export type PoseHumanEvidence = {
+  isPlausible: boolean;
+  isStrong: boolean;
+  visibleLandmarks: number;
+  headLandmarks: number;
+  completeArms: number;
+  completeLegs: number;
+  torsoScale: number;
+  score: number;
+};
+
+export type ConfirmedPersonPoseInput = {
+  poses: readonly (readonly PersonPosePoint[])[];
+  objects: readonly ObjectDetectionLike[];
+  faces: readonly ObjectDetectionLike[];
+  frameWidth: number;
+  frameHeight: number;
+  minObjectScore?: number;
+  minFaceScore?: number;
+};
+
+export type ConfirmedPersonPoseCandidate = PosePersonCandidate & {
+  humanEvidence: PoseHumanEvidence;
+  confirmedByObject: boolean;
+  confirmedByFace: boolean;
+  strongPoseOnly: boolean;
+};
+
 export type ObjectPersonCandidate = {
   detectionIndex: number;
   detection: ObjectDetectionLike;
@@ -85,6 +113,14 @@ const DEFAULT_MIN_POINT_VISIBILITY = 0.45;
 const DEFAULT_MIN_VISIBLE_POINTS = 6;
 const EXPECTED_POSE_LANDMARKS = 33;
 const CORE_POSE_LANDMARKS = [0, 7, 8, 11, 12, 23, 24, 25, 26, 27, 28];
+const TORSO_LANDMARKS = [11, 12, 23, 24] as const;
+const HEAD_LANDMARKS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] as const;
+const LEFT_ARM = [11, 13, 15] as const;
+const RIGHT_ARM = [12, 14, 16] as const;
+const LEFT_LEG = [23, 25, 27] as const;
+const RIGHT_LEG = [24, 26, 28] as const;
+const OPERATOR_POINT_VISIBILITY = 0.55;
+const OPERATOR_CORE_VISIBILITY = 0.62;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -193,6 +229,85 @@ function boxCenter(box: PersonBoundingBox) {
 
 function boxDiagonal(box: PersonBoundingBox) {
   return Math.hypot(box.width, box.height);
+}
+
+function pixelDistance(
+  first: PersonPosePoint,
+  second: PersonPosePoint,
+  frameWidth: number,
+  frameHeight: number,
+) {
+  return Math.hypot(
+    (first.x - second.x) * frameWidth,
+    (first.y - second.y) * frameHeight,
+  );
+}
+
+function chainIsPlausible(
+  pose: readonly PersonPosePoint[],
+  indexes: readonly number[],
+  torsoLength: number,
+  frameWidth: number,
+  frameHeight: number,
+) {
+  if (
+    torsoLength <= 0 ||
+    !indexes.every((index) =>
+      pointIsVisible(pose[index], OPERATOR_POINT_VISIBILITY),
+    )
+  ) {
+    return false;
+  }
+
+  const firstSegment = pixelDistance(
+    pose[indexes[0]],
+    pose[indexes[1]],
+    frameWidth,
+    frameHeight,
+  );
+  const secondSegment = pixelDistance(
+    pose[indexes[1]],
+    pose[indexes[2]],
+    frameWidth,
+    frameHeight,
+  );
+  const firstRatio = firstSegment / torsoLength;
+  const secondRatio = secondSegment / torsoLength;
+  const segmentBalance =
+    Math.max(firstSegment, secondSegment) /
+    Math.max(1, Math.min(firstSegment, secondSegment));
+  return (
+    firstRatio >= 0.18 &&
+    firstRatio <= 2.8 &&
+    secondRatio >= 0.18 &&
+    secondRatio <= 2.8 &&
+    segmentBalance <= 3.2
+  );
+}
+
+function pairAlignment(
+  pose: readonly PersonPosePoint[],
+  firstPair: readonly [number, number],
+  secondPair: readonly [number, number],
+  frameWidth: number,
+  frameHeight: number,
+) {
+  if (
+    ![...firstPair, ...secondPair].every((index) =>
+      pointIsVisible(pose[index], OPERATOR_POINT_VISIBILITY),
+    )
+  ) {
+    return 1;
+  }
+  const firstX = (pose[firstPair[1]].x - pose[firstPair[0]].x) * frameWidth;
+  const firstY = (pose[firstPair[1]].y - pose[firstPair[0]].y) * frameHeight;
+  const secondX = (pose[secondPair[1]].x - pose[secondPair[0]].x) * frameWidth;
+  const secondY = (pose[secondPair[1]].y - pose[secondPair[0]].y) * frameHeight;
+  const denominator =
+    Math.hypot(firstX, firstY) * Math.hypot(secondX, secondY);
+  return denominator > 0
+    ? (firstX * secondX + firstY * secondY) / denominator
+    : -1;
 }
 
 function centerDistanceRatio(
@@ -364,6 +479,270 @@ export function calculatePoseHeadFallbackBox(
     frameHeight,
   );
   return boxIsUsable(box, frameWidth, frameHeight) ? box : null;
+}
+
+/**
+ * Checks whether a pose has enough mutually consistent anatomy to be shown to
+ * an operator. MediaPipe intentionally returns a best-effort skeleton even on
+ * some textured objects, so landmark visibility alone is not human evidence.
+ */
+export function analyzePoseHumanEvidence(
+  pose: readonly PersonPosePoint[],
+  frameWidth: number,
+  frameHeight: number,
+): PoseHumanEvidence {
+  const empty: PoseHumanEvidence = {
+    isPlausible: false,
+    isStrong: false,
+    visibleLandmarks: 0,
+    headLandmarks: 0,
+    completeArms: 0,
+    completeLegs: 0,
+    torsoScale: 0,
+    score: 0,
+  };
+  if (frameWidth <= 0 || frameHeight <= 0 || pose.length < 29) return empty;
+
+  const visibleIndexes = pose
+    .map((point, index) =>
+      pointIsVisible(point, OPERATOR_POINT_VISIBILITY) ? index : -1,
+    )
+    .filter((index) => index >= 0);
+  const visibleLandmarks = visibleIndexes.length;
+  const headLandmarks = HEAD_LANDMARKS.filter((index) =>
+    pointIsVisible(pose[index], OPERATOR_POINT_VISIBILITY),
+  ).length;
+  const hasReliableTorso = TORSO_LANDMARKS.every((index) =>
+    pointIsVisible(pose[index], OPERATOR_CORE_VISIBILITY),
+  );
+  if (!hasReliableTorso) {
+    return { ...empty, visibleLandmarks, headLandmarks };
+  }
+
+  const leftShoulder = pose[11];
+  const rightShoulder = pose[12];
+  const leftHip = pose[23];
+  const rightHip = pose[24];
+  const shoulder = {
+    x: (leftShoulder.x + rightShoulder.x) / 2,
+    y: (leftShoulder.y + rightShoulder.y) / 2,
+  };
+  const hip = {
+    x: (leftHip.x + rightHip.x) / 2,
+    y: (leftHip.y + rightHip.y) / 2,
+  };
+  const torsoLength = Math.hypot(
+    (shoulder.x - hip.x) * frameWidth,
+    (shoulder.y - hip.y) * frameHeight,
+  );
+  const torsoScale = torsoLength / Math.min(frameWidth, frameHeight);
+  const shoulderSpan = pixelDistance(
+    leftShoulder,
+    rightShoulder,
+    frameWidth,
+    frameHeight,
+  );
+  const hipSpan = pixelDistance(
+    leftHip,
+    rightHip,
+    frameWidth,
+    frameHeight,
+  );
+  const shoulderRatio = shoulderSpan / Math.max(1, torsoLength);
+  const hipRatio = hipSpan / Math.max(1, torsoLength);
+  const torsoSideBalance =
+    Math.max(
+      pixelDistance(
+        leftShoulder,
+        leftHip,
+        frameWidth,
+        frameHeight,
+      ),
+      pixelDistance(
+        rightShoulder,
+        rightHip,
+        frameWidth,
+        frameHeight,
+      ),
+    ) /
+    Math.max(
+      1,
+      Math.min(
+        pixelDistance(
+          leftShoulder,
+          leftHip,
+          frameWidth,
+          frameHeight,
+        ),
+        pixelDistance(
+          rightShoulder,
+          rightHip,
+          frameWidth,
+          frameHeight,
+        ),
+      ),
+    );
+
+  const armChains = [LEFT_ARM, RIGHT_ARM].filter((chain) =>
+    chainIsPlausible(
+      pose,
+      chain,
+      torsoLength,
+      frameWidth,
+      frameHeight,
+    ),
+  ).length;
+  const legChains = [LEFT_LEG, RIGHT_LEG].filter((chain) =>
+    chainIsPlausible(
+      pose,
+      chain,
+      torsoLength,
+      frameWidth,
+      frameHeight,
+    ),
+  ).length;
+  const hasLowerEvidenceOnBothSides = [LEFT_LEG, RIGHT_LEG].every((chain) =>
+    chain.slice(1).some((index) =>
+      pointIsVisible(pose[index], OPERATOR_POINT_VISIBILITY),
+    ),
+  );
+  const pairGeometryIsConsistent =
+    pairAlignment(pose, [11, 12], [23, 24], frameWidth, frameHeight) > -0.1 &&
+    pairAlignment(pose, [11, 12], [25, 26], frameWidth, frameHeight) > -0.2 &&
+    pairAlignment(pose, [11, 12], [27, 28], frameWidth, frameHeight) > -0.2;
+  const ratiosArePlausible =
+    torsoScale >= 0.045 &&
+    torsoScale <= 0.85 &&
+    shoulderRatio >= 0.1 &&
+    shoulderRatio <= 2.1 &&
+    hipRatio >= 0.08 &&
+    hipRatio <= 1.9 &&
+    torsoSideBalance <= 3.2;
+  const isPlausible =
+    visibleLandmarks >= 8 &&
+    legChains >= 1 &&
+    ratiosArePlausible &&
+    pairGeometryIsConsistent;
+
+  const visibleAverage =
+    visibleIndexes.reduce(
+      (sum, index) => sum + clamp(pose[index].visibility ?? 1, 0, 1),
+      0,
+    ) / Math.max(1, visibleLandmarks);
+  const limbCoverage = clamp((armChains + legChains) / 4, 0, 1);
+  const score = clamp(
+    visibleAverage * 0.3 +
+      clamp(visibleLandmarks / 18, 0, 1) * 0.25 +
+      limbCoverage * 0.25 +
+      clamp(headLandmarks / 4, 0, 1) * 0.12 +
+      (pairGeometryIsConsistent ? 0.08 : 0),
+    0,
+    1,
+  );
+  const hasStrongBodyCoverage =
+    (headLandmarks >= 2 && armChains >= 1 && legChains >= 1) ||
+    (armChains === 2 && legChains === 2);
+  const isStrong =
+    isPlausible &&
+    visibleLandmarks >= 12 &&
+    hasLowerEvidenceOnBothSides &&
+    hasStrongBodyCoverage &&
+    score >= 0.7;
+
+  return {
+    isPlausible,
+    isStrong,
+    visibleLandmarks,
+    headLandmarks,
+    completeArms: armChains,
+    completeLegs: legChains,
+    torsoScale,
+    score,
+  };
+}
+
+function faceMatchesPoseHead(
+  pose: readonly PersonPosePoint[],
+  faceBox: PersonBoundingBox,
+  frameWidth: number,
+  frameHeight: number,
+) {
+  const headBox = calculatePoseHeadFallbackBox(
+    pose,
+    frameWidth,
+    frameHeight,
+  );
+  if (!headBox) return false;
+  return (
+    boxContainment(faceBox, headBox) >= 0.35 ||
+    (personBoxIou(faceBox, headBox) >= 0.08 &&
+      centerDistanceRatio(faceBox, headBox) <= 0.65)
+  );
+}
+
+/**
+ * Returns only poses suitable for counts, red overlays, and fall decisions.
+ * Privacy masking deliberately continues to use the broader raw pose set.
+ */
+export function selectConfirmedPersonPoses(
+  input: ConfirmedPersonPoseInput,
+): ConfirmedPersonPoseCandidate[] {
+  const candidates = deduplicatePoseDetections(
+    input.poses,
+    input.frameWidth,
+    input.frameHeight,
+  );
+  const objectPeople = nonMaximumSuppressObjectPeople(
+    input.objects,
+    input.frameWidth,
+    input.frameHeight,
+    { minScore: input.minObjectScore ?? 0.62 },
+  );
+  const faceBoxes = input.faces
+    .filter(
+      (face) =>
+        Number.isFinite(face.score) &&
+        face.score >= (input.minFaceScore ?? 0.65) &&
+        boxIsUsable(face.boundingBox, input.frameWidth, input.frameHeight),
+    )
+    .map((face) =>
+      clippedBox(face.boundingBox!, input.frameWidth, input.frameHeight),
+    );
+
+  return candidates.flatMap((candidate) => {
+    const evidence = analyzePoseHumanEvidence(
+      candidate.pose,
+      input.frameWidth,
+      input.frameHeight,
+    );
+    const hasObjectEvidence = objectPeople.some(
+      (object) => poseObjectMatchScore(candidate.box, object.box) !== null,
+    );
+    const hasFaceEvidence = faceBoxes.some((faceBox) =>
+      faceMatchesPoseHead(
+        candidate.pose,
+        faceBox,
+        input.frameWidth,
+        input.frameHeight,
+      ),
+    );
+    const hasCorroboratingEvidence = hasObjectEvidence || hasFaceEvidence;
+    if (
+      !evidence.isStrong &&
+      !(evidence.isPlausible && hasCorroboratingEvidence)
+    ) {
+      return [];
+    }
+    return [
+      {
+        ...candidate,
+        humanEvidence: evidence,
+        confirmedByObject: hasObjectEvidence,
+        confirmedByFace: hasFaceEvidence,
+        strongPoseOnly: evidence.isStrong && !hasCorroboratingEvidence,
+      },
+    ];
+  });
 }
 
 function sharedLandmarkDistanceRatio(

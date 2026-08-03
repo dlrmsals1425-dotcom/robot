@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  analyzePoseHumanEvidence,
   calculatePoseBodyBox,
   calculatePoseHeadFallbackBox,
   calculatePoseQuality,
   deduplicatePoseDetections,
   fusePersonDetections,
   nonMaximumSuppressObjectPeople,
+  selectConfirmedPersonPoses,
   updatePersonCountTrack,
 } from "../app/person-detection.ts";
 
@@ -48,6 +50,31 @@ function makeStandingPose(centerX = 0.5, visibility = 0.95) {
   return pose;
 }
 
+function makeTabletopFalsePose() {
+  const pose = emptyPose();
+  setPoint(pose, 11, 0.18, 0.56, 0.94);
+  setPoint(pose, 12, 0.36, 0.55, 0.91);
+  setPoint(pose, 23, 0.46, 0.58, 0.93);
+  setPoint(pose, 24, 0.63, 0.57, 0.9);
+  setPoint(pose, 25, 0.58, 0.61, 0.88);
+  setPoint(pose, 27, 0.82, 0.63, 0.86);
+  return pose;
+}
+
+function makeDenseTabletopFalsePose() {
+  const pose = makeStandingPose();
+  // Pose models can hallucinate many high-confidence points on a textured
+  // object. Reverse the left/right lower-body topology to mimic the crossed
+  // skeleton visible in the reported tabletop false positive.
+  setPoint(pose, 23, 0.6, 0.55, 0.97);
+  setPoint(pose, 24, 0.4, 0.55, 0.97);
+  setPoint(pose, 25, 0.63, 0.72, 0.96);
+  setPoint(pose, 26, 0.37, 0.72, 0.96);
+  setPoint(pose, 27, 0.65, 0.9, 0.95);
+  setPoint(pose, 28, 0.35, 0.9, 0.95);
+  return pose;
+}
+
 function shiftedPose(pose, xShift, yShift, visibility) {
   return pose.map((point) =>
     point.visibility > 0
@@ -78,6 +105,109 @@ test("calculates pose quality and a usable body bounding box", () => {
   assert.ok(box);
   assert.ok(box.width > 100);
   assert.ok(box.height > 300);
+});
+
+test("keeps a broad pose for privacy but rejects tabletop geometry for operators", () => {
+  const tabletopPose = makeTabletopFalsePose();
+  assert.ok(calculatePoseBodyBox(tabletopPose, 640, 480));
+  assert.equal(
+    analyzePoseHumanEvidence(tabletopPose, 640, 480).isStrong,
+    false,
+  );
+
+  const confirmed = selectConfirmedPersonPoses({
+    poses: [tabletopPose],
+    objects: [
+      {
+        categoryName: "sports ball",
+        score: 0.92,
+        boundingBox: { originX: 100, originY: 250, width: 430, height: 70 },
+      },
+    ],
+    faces: [],
+    frameWidth: 640,
+    frameHeight: 480,
+  });
+  assert.equal(confirmed.length, 0);
+});
+
+test("rejects a dense crossed tabletop skeleton even beside a false person box", () => {
+  const pose = makeDenseTabletopFalsePose();
+  const evidence = analyzePoseHumanEvidence(pose, 640, 480);
+  assert.ok(evidence.visibleLandmarks >= 12);
+  assert.equal(evidence.isPlausible, false);
+  assert.equal(evidence.isStrong, false);
+
+  const confirmed = selectConfirmedPersonPoses({
+    poses: [pose],
+    objects: [personObject(205, 60, 230, 390, 0.99)],
+    faces: [],
+    frameWidth: 640,
+    frameHeight: 480,
+  });
+  assert.equal(confirmed.length, 0);
+});
+
+test("accepts a complete anatomical pose without requiring network evidence", () => {
+  const pose = makeStandingPose();
+  const evidence = analyzePoseHumanEvidence(pose, 640, 480);
+  assert.equal(evidence.isPlausible, true);
+  assert.equal(evidence.isStrong, true);
+
+  const confirmed = selectConfirmedPersonPoses({
+    poses: [pose],
+    objects: [],
+    faces: [],
+    frameWidth: 640,
+    frameHeight: 480,
+  });
+  assert.equal(confirmed.length, 1);
+  assert.equal(confirmed[0].strongPoseOnly, true);
+});
+
+test("uses a matching person object to confirm a partially occluded pose", () => {
+  const pose = makeStandingPose();
+  for (const index of [0, 7, 8, 14, 16, 26, 28]) {
+    pose[index].visibility = 0.2;
+  }
+  const evidence = analyzePoseHumanEvidence(pose, 640, 480);
+  assert.equal(evidence.isPlausible, true);
+  assert.equal(evidence.isStrong, false);
+
+  const withoutObject = selectConfirmedPersonPoses({
+    poses: [pose],
+    objects: [],
+    faces: [],
+    frameWidth: 640,
+    frameHeight: 480,
+  });
+  const withObject = selectConfirmedPersonPoses({
+    poses: [pose],
+    objects: [personObject(215, 65, 210, 385, 0.78)],
+    faces: [],
+    frameWidth: 640,
+    frameHeight: 480,
+  });
+  assert.equal(withoutObject.length, 0);
+  assert.equal(withObject.length, 1);
+  assert.equal(withObject[0].confirmedByObject, true);
+});
+
+test("does not let an unrelated face turn a weak pose into a person", () => {
+  const confirmed = selectConfirmedPersonPoses({
+    poses: [makeTabletopFalsePose()],
+    objects: [],
+    faces: [
+      {
+        categoryName: "face",
+        score: 0.97,
+        boundingBox: { originX: 560, originY: 20, width: 55, height: 55 },
+      },
+    ],
+    frameWidth: 640,
+    frameHeight: 480,
+  });
+  assert.equal(confirmed.length, 0);
 });
 
 test("estimates a head mask above standing shoulders and along a lying torso", () => {

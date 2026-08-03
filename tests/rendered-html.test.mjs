@@ -73,6 +73,7 @@ test("ships the PWA shell and pinned local AI assets", async () => {
     "public/branding/goyang-polybot-scene-v3.png",
     "public/branding/goyang-polybot-user-cutout-v1.png",
     "public/models/pose_landmarker_lite.task",
+    "public/models/pose_landmarker_full.task",
     "public/models/blaze_face_full_range.tflite",
     "public/models/efficientdet_lite0_uint8.tflite",
     "MODEL_CHECKSUMS.txt",
@@ -89,7 +90,7 @@ test("ships the PWA shell and pinned local AI assets", async () => {
       readFile(new URL("app/page.tsx", templateRoot), "utf8"),
       readFile(new URL("app/vision.worker.ts", templateRoot), "utf8"),
       readFile(new URL("package.json", templateRoot), "utf8"),
-      stat(new URL("public/models/pose_landmarker_lite.task", templateRoot)),
+      stat(new URL("public/models/pose_landmarker_full.task", templateRoot)),
     ]);
 
   assert.match(manifest, /"display": "standalone"/);
@@ -108,6 +109,8 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   );
   assert.match(visionWorker, /canvas: createTaskCanvas\(\)/);
   assert.match(visionWorker, /new OffscreenCanvas\(1, 1\)/);
+  assert.match(visionWorker, /pose_landmarker_full\.task/);
+  assert.match(visionWorker, /minPoseDetectionConfidence: 0\.6/);
   assert.match(packageJson, /"@mediapipe\/tasks-vision": "0\.10\.35"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.ok(poseModel.size > 1_000_000);
@@ -134,16 +137,17 @@ test("keeps safety alerts compact and person overlays red", async () => {
   assert.match(page, /const PERSON_DETECTION_COLOR = "#ff4d5a"/);
   assert.match(page, /const OBJECT_DETECTION_COLOR = "#7bd4ff"/);
   assert.match(page, /fusePersonDetections/);
+  assert.match(page, /selectConfirmedPersonPoses/);
   assert.match(page, /사람 · 자세 추적/);
   assert.doesNotMatch(page, /drawBox\(box,\s*"사람",\s*1/);
-  assert.match(page, /for \(const pose of result\.poses\)/);
+  assert.match(page, /for \(const pose of confirmedPoses\)/);
   assert.match(
     await readFile(new URL("app/vision.worker.ts", templateRoot), "utf8"),
     /deduplicatePoseDetections/,
   );
   assert.match(page, /role="alertdialog"/);
-  assert.match(fallDetection, /angleFromHorizontal < 30/);
-  assert.match(fallDetection, /completeLeg/);
+  assert.match(fallDetection, /angleFromHorizontal < 28/);
+  assert.match(fallDetection, /humanEvidence\.isStrong/);
   assert.match(fallDetection, /FALL_NEGATIVE_BUDGET_MS/);
 });
 

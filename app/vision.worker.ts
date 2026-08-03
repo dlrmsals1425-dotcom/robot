@@ -92,14 +92,14 @@ async function initialize(baseUrl: string) {
     PoseLandmarker.createFromOptions(vision, {
       canvas: createTaskCanvas(),
       baseOptions: {
-        modelAssetPath: `${baseUrl}/models/pose_landmarker_lite.task`,
+        modelAssetPath: `${baseUrl}/models/pose_landmarker_full.task`,
         delegate: "CPU",
       },
       runningMode: "VIDEO",
       numPoses: 2,
-      minPoseDetectionConfidence: 0.52,
-      minPosePresenceConfidence: 0.52,
-      minTrackingConfidence: 0.5,
+      minPoseDetectionConfidence: 0.6,
+      minPosePresenceConfidence: 0.6,
+      minTrackingConfidence: 0.55,
       outputSegmentationMasks: false,
     }),
     FaceDetector.createFromOptions(vision, {
