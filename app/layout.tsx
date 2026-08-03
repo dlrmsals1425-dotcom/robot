@@ -30,10 +30,10 @@ export async function generateMetadata(): Promise<Metadata> {
   const origin = `${protocol}://${host}`;
 
   return {
-    title: "SAFEBOT | 주민안전 AI 순찰·관제",
+    title: "고양 폴리봇 | AI 감지·실시간 안전관제",
     description:
-      "현장 카메라로 사람과 사물을 감지하고, 익명화된 10초 사건 영상을 관제센터에 전달하는 주민안전 AI MVP",
-    applicationName: "SAFEBOT",
+      "사람과 사물을 감지하고 쓰러짐 의심 자세를 10초간 확인해 관제센터에 전달하는 고양 폴리봇 AI 관제 프로토타입",
+    applicationName: "고양 폴리봇 SAFEBOT",
     manifest: "/manifest.webmanifest",
     formatDetection: {
       telephone: false,
@@ -43,7 +43,7 @@ export async function generateMetadata(): Promise<Metadata> {
     appleWebApp: {
       capable: true,
       statusBarStyle: "black-translucent",
-      title: "SAFEBOT",
+      title: "고양 폴리봇",
     },
     icons: {
       icon: [
@@ -56,26 +56,26 @@ export async function generateMetadata(): Promise<Metadata> {
     openGraph: {
       type: "website",
       url: origin,
-      title: "SAFEBOT | 주민안전 AI 순찰·관제",
+      title: "AI 감지 기능을 탑재한 고양 폴리봇",
       description:
-        "현장 순찰 로봇과 비공개 사건 영상을 연결하는 개인정보 보호형 안전 관제 MVP",
-      siteName: "SAFEBOT",
+        "사람·사물 감지, 쓰러짐 10초 확인, 얼굴 비식별화를 검증하는 주민안전 AI 관제 프로토타입",
+      siteName: "고양 폴리봇 SAFEBOT",
       locale: "ko_KR",
       images: [
         {
-          url: new URL("/og-control-center.png", origin),
+          url: new URL("/og-goyang-polybot-v3.jpg", origin),
           width: 1200,
           height: 630,
-          alt: "주민 공간을 순찰하는 SAFEBOT과 영상을 확인하는 관제센터",
+          alt: "AI 감지 기능을 탑재한 고양 폴리봇 주민안전 관제 프로토타입",
         },
       ],
     },
     twitter: {
       card: "summary_large_image",
-      title: "SAFEBOT | 주민안전 AI 순찰·관제",
+      title: "AI 감지 기능을 탑재한 고양 폴리봇",
       description:
-        "현장 단말의 익명화 사건 영상을 확인하는 Physical AI 안전 관제 실증",
-      images: [new URL("/og-control-center.png", origin)],
+        "현장 감지부터 익명화 영상 관제 알림까지 연결하는 Physical AI 안전관제 실증",
+      images: [new URL("/og-goyang-polybot-v3.jpg", origin)],
     },
   };
 }

@@ -299,13 +299,13 @@ export default function ControlCenter() {
   return (
     <main className="control-root">
       <header className="control-topbar">
-        <Link className="brand" href="/control" aria-label="SAFEBOT 관제센터 홈">
+        <Link className="brand" href="/control" aria-label="고양 폴리봇 관제센터 홈">
           <span className="brand-mark">
             <ShieldCheck size={21} strokeWidth={2.3} aria-hidden="true" />
           </span>
           <span>
-            <strong>SAFEBOT</strong>
-            <small>주민안전 통합관제센터</small>
+            <strong>고양 폴리봇</strong>
+            <small>SAFEBOT 통합관제센터</small>
           </span>
         </Link>
         <div className="topbar-actions">

@@ -2697,14 +2697,14 @@ export default function Home() {
         <button
           className="brand"
           onClick={() => setView("patrol")}
-          aria-label="SAFEBOT 순찰 화면으로 이동"
+          aria-label="고양 폴리봇 순찰 화면으로 이동"
         >
           <span className="brand-mark">
             <ShieldCheck size={21} strokeWidth={2.3} aria-hidden="true" />
           </span>
           <span>
-            <strong>SAFEBOT</strong>
-            <small>주민안전 AI 순찰</small>
+            <strong>고양 폴리봇</strong>
+            <small>SAFEBOT · AI 감지 순찰</small>
           </span>
         </button>
         <div className="topbar-actions">
@@ -2805,12 +2805,12 @@ export default function Home() {
                 <div>
                   <span className="eyebrow">
                     <Radio size={14} aria-hidden="true" />
-                    MOBILE EDGE VISION
+                    GOYANG POLYBOT · EDGE VISION
                   </span>
-                  <h1>주변을 살피고, 위험 신호를 놓치지 않도록.</h1>
+                  <h1>AI 감지 기능을 탑재한 고양 폴리봇</h1>
                   <p>
-                    휴대폰 후면 카메라로 사람과 사물을 감지하고 누운
-                    자세를 10초간 확인합니다.
+                    사람과 사물을 감지하고, 쓰러짐 의심 자세를 10초간
+                    확인해 관제센터와 연결합니다.
                   </p>
                 </div>
                 <div className="heading-actions">
@@ -2877,7 +2877,7 @@ export default function Home() {
                       )}
                       {cameraState === "starting"
                         ? "AI 준비 중"
-                        : "카메라 순찰 시작"}
+                        : "폴리봇 AI 감지 시작"}
                     </button>
                   )}
                 </div>
@@ -2892,8 +2892,8 @@ export default function Home() {
                     <span
                       className={`live-indicator ${cameraState === "running" ? "active" : ""}`}
                     />
-                    <strong>모바일 순찰 카메라 01</strong>
-                    <span>일반 외부 환경</span>
+                    <strong>고양 폴리봇 AI 실증 카메라</strong>
+                    <span>모바일 프로토타입</span>
                   </div>
                   <div className="camera-signals">
                     <span>
@@ -2950,7 +2950,7 @@ export default function Home() {
                             ? "휴대폰 안에서 AI를 준비하고 있습니다"
                             : cameraState === "error"
                               ? "카메라 연결을 확인해 주세요"
-                              : "카메라를 켜면 AI 순찰이 시작됩니다"}
+                              : "고양 폴리봇 AI 감지를 시작합니다"}
                         </strong>
                         <p>{modelMessage}</p>
                       </div>
@@ -2960,7 +2960,7 @@ export default function Home() {
                           onClick={startCamera}
                         >
                           <Camera size={18} aria-hidden="true" />
-                          후면 카메라 연결
+                          AI 카메라 시작
                         </button>
                       )}
                     </div>

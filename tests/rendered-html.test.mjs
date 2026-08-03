@@ -29,7 +29,7 @@ async function render(pathname = "/") {
   );
 }
 
-test("server-renders the SAFEBOT mobile patrol product", async () => {
+test("server-renders the Goyang Polybot mobile patrol product", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
@@ -38,20 +38,22 @@ test("server-renders the SAFEBOT mobile patrol product", async () => {
   assert.match(html, /<html lang="ko">/i);
   assert.match(
     html,
-    /<title>SAFEBOT \| 주민안전 AI 순찰(?:·관제)?<\/title>/i,
+    /<title>고양 폴리봇 \| AI 감지·실시간 안전관제<\/title>/i,
   );
   assert.match(html, /SAFEBOT/);
-  assert.match(html, /카메라 순찰 시작/);
+  assert.match(html, /AI 감지 기능을 탑재한 고양 폴리봇/);
+  assert.match(html, /폴리봇 AI 감지 시작/);
+  assert.match(html, /og-goyang-polybot-v3\.jpg/);
   assert.match(html, /10초 알림 흐름 테스트/);
   assert.match(html, /얼굴 익명화/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/);
 });
 
-test("server-renders the protected SAFEBOT control-center entry", async () => {
+test("server-renders the protected Goyang Polybot control-center entry", async () => {
   const response = await render("/control");
   assert.equal(response.status, 200);
   const html = await response.text();
-  assert.match(html, /SAFEBOT 관제센터 \| 주민안전 AI 순찰/);
+  assert.match(html, /고양 폴리봇 관제센터 \| SAFEBOT/);
   assert.match(html, /보안 연결을 확인하고 있습니다/);
   assert.match(html, /관제 영상과 이벤트 이력은 인증된 담당자에게만 표시/);
   assert.match(html, /현장기기/);
@@ -64,6 +66,9 @@ test("ships the PWA shell and pinned local AI assets", async () => {
     "public/icons/icon-192.png",
     "public/icons/icon-512.png",
     "public/og.png",
+    "public/og-goyang-polybot-v3.jpg",
+    "public/branding/goyang-polybot-scene-v3.png",
+    "public/branding/goyang-polybot-user-cutout-v1.png",
     "public/models/pose_landmarker_lite.task",
     "public/models/blaze_face_full_range.tflite",
     "public/models/efficientdet_lite0_uint8.tflite",
