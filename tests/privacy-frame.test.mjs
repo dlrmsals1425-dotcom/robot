@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   decidePrivacyFrame,
+  emptySceneVerificationIsFresh,
   resolvePrivacyFrameMode,
+  updateEmptySceneVerification,
 } from "../app/privacy-frame.ts";
 
 const protectedCurrentFrame = {
@@ -13,7 +15,7 @@ const protectedCurrentFrame = {
   currentPersonRegionCount: 1,
   protectedPersonRegionCount: 1,
   peopleSpatiallyAligned: true,
-  objectUpdated: true,
+  emptySceneVerified: true,
 };
 
 test("sanitizes multiple people when every current region is protected", () => {
@@ -69,7 +71,7 @@ test("sanitizes an exactly verified empty scene", () => {
       ...protectedCurrentFrame,
       currentPersonRegionCount: 0,
       protectedPersonRegionCount: 0,
-      objectUpdated: true,
+      emptySceneVerified: true,
     }),
     {
       mode: "sanitize",
@@ -84,7 +86,7 @@ test("holds while the exact-frame object result needed for an empty scene is pen
       ...protectedCurrentFrame,
       currentPersonRegionCount: 0,
       protectedPersonRegionCount: 0,
-      objectUpdated: false,
+      emptySceneVerified: false,
     }),
     {
       mode: "hold",
@@ -143,4 +145,44 @@ test("holds after a selective mask or fallback rendering failure", () => {
     sourceMatchesResult: false,
   });
   assert.equal(resolvePrivacyFrameMode(fatalDecision, true), "opaque");
+});
+
+test("keeps a recent exact empty verification between object scans", () => {
+  let verification = {
+    consecutiveEmptyObjectScans: 0,
+    verifiedAt: null,
+  };
+  verification = updateEmptySceneVerification(verification, {
+    now: 0,
+    sceneEligible: true,
+    objectUpdated: true,
+    requiredScans: 2,
+  });
+  assert.equal(emptySceneVerificationIsFresh(verification, 100, 500), false);
+
+  verification = updateEmptySceneVerification(verification, {
+    now: 400,
+    sceneEligible: true,
+    objectUpdated: true,
+    requiredScans: 2,
+  });
+  assert.equal(emptySceneVerificationIsFresh(verification, 850, 500), true);
+  assert.equal(emptySceneVerificationIsFresh(verification, 901, 500), false);
+});
+
+test("immediately clears empty-scene trust when a person region appears", () => {
+  const verification = updateEmptySceneVerification(
+    { consecutiveEmptyObjectScans: 2, verifiedAt: 400 },
+    {
+      now: 450,
+      sceneEligible: false,
+      objectUpdated: false,
+      requiredScans: 2,
+    },
+  );
+  assert.deepEqual(verification, {
+    consecutiveEmptyObjectScans: 0,
+    verifiedAt: null,
+  });
+  assert.equal(emptySceneVerificationIsFresh(verification, 450, 500), false);
 });

@@ -109,8 +109,12 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   );
   assert.match(visionWorker, /canvas: createTaskCanvas\(\)/);
   assert.match(visionWorker, /new OffscreenCanvas\(1, 1\)/);
-  assert.match(visionWorker, /pose_landmarker_full\.task/);
+  assert.match(visionWorker, /pose_landmarker_lite\.task/);
   assert.match(visionWorker, /minPoseDetectionConfidence: 0\.6/);
+  assert.match(page, /const ANALYSIS_MAX_EDGE = 640/);
+  assert.match(page, /const INFERENCE_TARGET_INTERVAL_MS = 85/);
+  assert.match(page, /const PRIVACY_EMPTY_VERIFIED_TTL_MS = 500/);
+  assert.match(visionWorker, /const OBJECT_DETECTION_INTERVAL_MS = 400/);
   assert.match(packageJson, /"@mediapipe\/tasks-vision": "0\.10\.35"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.ok(poseModel.size > 1_000_000);

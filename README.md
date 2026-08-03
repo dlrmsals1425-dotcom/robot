@@ -35,8 +35,9 @@ TURN 설정이나 연결에 문제가 생기면 같은 인증 WebSocket이 익�
 
 ## 현재 구현 범위
 
-- MediaPipe Pose Landmarker Full과 인체 관절 구조 검증을 이용한 자세 분석
+- MediaPipe Pose Landmarker Lite와 인체 관절 구조 검증을 이용한 균형형 자세 분석
 - 사람 객체·얼굴·자세의 교차 확인으로 관제 표시와 쓰러짐 오탐 억제
+- 빈 장면은 객체 감지 2회 확인 후 0.5초 신뢰 창과 매 프레임 얼굴·자세 감지를 결합해 안전 프레임을 연속 갱신
 - MediaPipe Object Detector를 이용한 사람·일반 사물 감지
 - MediaPipe Face Detector와 자세·사람 영역 폴백을 이용한 얼굴 픽셀화
 - 10초 연속 확인, 10초 이내 회복, 오탐 취소, 추적 중단 상태
@@ -62,6 +63,11 @@ TURN 설정이나 연결에 문제가 생기면 같은 인증 WebSocket이 익�
 미탐한 경우까지 완전히 보장할 수는 없습니다. 실제 공개 장소 운영 전에는
 촬영 고지와 함께 야간·역광·군중·가림 조건의 별도 개인정보 보호 검증이
 필요합니다.
+
+부드러운 빈 장면 송출을 위해 최근 0.5초 이내의 정확한 객체 빈 장면 확인을
+매 프레임 얼굴·자세 감지와 함께 사용합니다. 사람이 새로 진입하면 얼굴·자세
+영역이 즉시 보호되고 객체 검사는 최대 0.4초 간격으로 다시 확인하지만, 세
+모델이 동시에 미탐하는 경우까지 보장하는 개인정보 보호 인증 제품은 아닙니다.
 
 화면이 잠기거나 브라우저가 백그라운드로 이동하면 휴대폰 카메라 감지와
 실시간 송출은 중단됩니다. 현재 알림은 감지를 실행 중인 기기에 표시되는 로컬
@@ -192,8 +198,8 @@ Realtime의 무료 포함량을 사용합니다. Realtime은 매월 첫 1,000GB�
 
 모델과 WASM 런타임을 `public/` 아래에 고정해 런타임 CDN 버전 변경에 영향을 받지 않도록 했습니다.
 
-- `pose_landmarker_full.task` (현재 관제 정확도 우선 모델)
-- `pose_landmarker_lite.task` (저사양 기기 비교용 보관 모델)
+- `pose_landmarker_lite.task` (현재 모바일 균형형 모델)
+- `pose_landmarker_full.task` (고성능 기기 비교·정밀 실험용 보관 모델)
 - `blaze_face_full_range.tflite`
 - `efficientdet_lite0_uint8.tflite`
 - `@mediapipe/tasks-vision` WASM 런타임

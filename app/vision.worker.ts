@@ -42,6 +42,7 @@ let faceDetector: FaceDetector | null = null;
 let objectDetector: ObjectDetector | null = null;
 let lastObjectDetectionAt = -Infinity;
 let cachedObjects: PlainDetection[] = [];
+const OBJECT_DETECTION_INTERVAL_MS = 400;
 
 function createTaskCanvas() {
   if (typeof OffscreenCanvas === "undefined") {
@@ -92,7 +93,7 @@ async function initialize(baseUrl: string) {
     PoseLandmarker.createFromOptions(vision, {
       canvas: createTaskCanvas(),
       baseOptions: {
-        modelAssetPath: `${baseUrl}/models/pose_landmarker_full.task`,
+        modelAssetPath: `${baseUrl}/models/pose_landmarker_lite.task`,
         delegate: "CPU",
       },
       runningMode: "VIDEO",
@@ -149,7 +150,7 @@ function analyzeFrame(message: FrameMessage) {
     ).map((candidate) => serializedPoses[candidate.poseIndex]);
     let objectUpdated = false;
 
-    if (timestamp - lastObjectDetectionAt >= 850) {
+    if (timestamp - lastObjectDetectionAt >= OBJECT_DETECTION_INTERVAL_MS) {
       const objectResult = objectDetector.detectForVideo(frame, timestamp);
       cachedObjects = serializeDetections(objectResult.detections);
       lastObjectDetectionAt = timestamp;

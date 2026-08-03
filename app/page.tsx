@@ -86,8 +86,11 @@ import {
 } from "./person-detection";
 import {
   decidePrivacyFrame,
+  emptySceneVerificationIsFresh,
   resolvePrivacyFrameMode,
+  type EmptySceneVerificationState,
   type PrivacyFrameDecision,
+  updateEmptySceneVerification,
 } from "./privacy-frame";
 
 type AppView = "patrol" | "history" | "guide";
@@ -188,7 +191,11 @@ const MAX_VERIFICATION_WALL_MS = 20_000;
 const PRIVACY_RESULT_MAX_AGE_MS = 650;
 const PRIVACY_HOLD_MAX_MS = 1_200;
 const PRIVACY_EMPTY_SCANS_REQUIRED = 2;
+const PRIVACY_EMPTY_VERIFIED_TTL_MS = 500;
 const PERSON_COUNT_HOLD_MS = 1_050;
+const ANALYSIS_MAX_EDGE = 640;
+const INFERENCE_BUSY_RETRY_MS = 45;
+const INFERENCE_TARGET_INTERVAL_MS = 85;
 const STORAGE_KEY = "safebot-safety-events-v1";
 const DEVICE_ID_KEY = "safebot-device-id-v1";
 const MIN_DISPLAY_PERSON_SCORE = 0.62;
@@ -438,7 +445,12 @@ export default function Home() {
   const privacySourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const privacySanitizedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const privacyHoldStartedRef = useRef<number | null>(null);
-  const privacyEmptyScanCountRef = useRef(0);
+  const privacyEmptyVerificationRef = useRef<EmptySceneVerificationState>({
+    consecutiveEmptyObjectScans: 0,
+    verifiedAt: null,
+  });
+  const safeFrameVersionRef = useRef(0);
+  const drawnSafeFrameVersionRef = useRef(-1);
   const personCountTrackRef = useRef<PersonCountTrack | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workerRef = useRef<Worker | null>(null);
@@ -1282,6 +1294,7 @@ export default function Home() {
         recordingCanvas.width,
         recordingCanvas.height,
       );
+      safeFrameVersionRef.current += 1;
     }
 
     void recordingSessionRef.current?.discard();
@@ -1368,6 +1381,7 @@ export default function Home() {
                 recordingCanvas.width,
                 recordingCanvas.height,
               );
+              safeFrameVersionRef.current += 1;
             }
           } finally {
             if (pendingTimestamp === event.data.timestamp) {
@@ -1444,8 +1458,15 @@ export default function Home() {
         pixelCanvasRef.current = document.createElement("canvas");
       }
       const pixelCanvas = pixelCanvasRef.current;
-      pixelCanvas.width = clamp(Math.round(width / 22), 4, 12);
-      pixelCanvas.height = clamp(Math.round(height / 22), 4, 12);
+      const pixelWidth = clamp(Math.round(width / 22), 4, 12);
+      const pixelHeight = clamp(Math.round(height / 22), 4, 12);
+      if (
+        pixelCanvas.width !== pixelWidth ||
+        pixelCanvas.height !== pixelHeight
+      ) {
+        pixelCanvas.width = pixelWidth;
+        pixelCanvas.height = pixelHeight;
+      }
       const pixelContext = pixelCanvas.getContext("2d");
       if (!pixelContext) return false;
 
@@ -1629,6 +1650,7 @@ export default function Home() {
     context.fillStyle = CANVAS_DARK_COLOR;
     context.fillRect(0, 0, recordingCanvas.width, recordingCanvas.height);
     context.restore();
+    safeFrameVersionRef.current += 1;
   }, []);
 
   const publishPrivacyFrame = useCallback(
@@ -1653,8 +1675,13 @@ export default function Home() {
         privacySourceCanvasRef.current = document.createElement("canvas");
       }
       const sourceCanvas = privacySourceCanvasRef.current;
-      sourceCanvas.width = result.frameWidth;
-      sourceCanvas.height = result.frameHeight;
+      if (
+        sourceCanvas.width !== result.frameWidth ||
+        sourceCanvas.height !== result.frameHeight
+      ) {
+        sourceCanvas.width = result.frameWidth;
+        sourceCanvas.height = result.frameHeight;
+      }
       const sourceContext = sourceCanvas.getContext("2d", { alpha: false });
       if (!sourceContext) {
         writeOpaqueRecordingFrame();
@@ -1676,8 +1703,13 @@ export default function Home() {
         privacySanitizedCanvasRef.current = document.createElement("canvas");
       }
       const sanitizedCanvas = privacySanitizedCanvasRef.current;
-      sanitizedCanvas.width = result.frameWidth;
-      sanitizedCanvas.height = result.frameHeight;
+      if (
+        sanitizedCanvas.width !== result.frameWidth ||
+        sanitizedCanvas.height !== result.frameHeight
+      ) {
+        sanitizedCanvas.width = result.frameWidth;
+        sanitizedCanvas.height = result.frameHeight;
+      }
       const sanitizedContext = sanitizedCanvas.getContext("2d", {
         alpha: false,
       });
@@ -1821,25 +1853,30 @@ export default function Home() {
           ),
         );
 
-      const ageMs = performance.now() - result.timestamp;
+      const privacyNow = performance.now();
+      const ageMs = privacyNow - result.timestamp;
       const resultIsFresh =
         Number.isFinite(ageMs) &&
         ageMs >= 0 &&
         ageMs <= PRIVACY_RESULT_MAX_AGE_MS;
-      if (currentPersonRegions.length > 0) {
-        privacyEmptyScanCountRef.current = 0;
-      } else if (
-        !resultIsFresh ||
-        !sanitizedContext ||
-        !peopleSpatiallyAligned
-      ) {
-        privacyEmptyScanCountRef.current = 0;
-      } else if (result.objectUpdated) {
-        privacyEmptyScanCountRef.current += 1;
-      }
-      const exactEmptySceneVerified =
-        result.objectUpdated &&
-        privacyEmptyScanCountRef.current >= PRIVACY_EMPTY_SCANS_REQUIRED;
+      privacyEmptyVerificationRef.current = updateEmptySceneVerification(
+        privacyEmptyVerificationRef.current,
+        {
+          now: privacyNow,
+          sceneEligible:
+            currentPersonRegions.length === 0 &&
+            resultIsFresh &&
+            Boolean(sanitizedContext) &&
+            peopleSpatiallyAligned,
+          objectUpdated: result.objectUpdated,
+          requiredScans: PRIVACY_EMPTY_SCANS_REQUIRED,
+        },
+      );
+      const emptySceneVerified = emptySceneVerificationIsFresh(
+        privacyEmptyVerificationRef.current,
+        privacyNow,
+        PRIVACY_EMPTY_VERIFIED_TTL_MS,
+      );
       const decision: PrivacyFrameDecision = decidePrivacyFrame({
         sourceMatchesResult: true,
         resultIsFresh,
@@ -1848,10 +1885,7 @@ export default function Home() {
         protectedPersonRegionCount:
           currentPersonRegions.length - unprotectedPersonRegionCount,
         peopleSpatiallyAligned,
-        objectUpdated:
-          currentPersonRegions.length > 0
-            ? result.objectUpdated
-            : exactEmptySceneVerified,
+        emptySceneVerified,
       });
 
       if (!sanitizedContext) {
@@ -1942,9 +1976,6 @@ export default function Home() {
       }
       privacyHoldStartedRef.current = null;
       setPrivacyFrameHeld(false);
-      if (decision.reason === "verified_empty_scene") {
-        privacyEmptyScanCountRef.current = 0;
-      }
       drawPrivacyOverlays(sanitizedContext, result);
       sanitizedContext.restore();
 
@@ -1985,6 +2016,7 @@ export default function Home() {
         recordingCanvas.height,
       );
       recordingContext.restore();
+      safeFrameVersionRef.current += 1;
       return true;
     },
     [
@@ -2002,6 +2034,8 @@ export default function Home() {
     const safeFrame = recordingCanvasRef.current;
     const canvas = canvasRef.current;
     if (!safeFrame || !canvas) return;
+    const safeFrameVersion = safeFrameVersionRef.current;
+    if (drawnSafeFrameVersionRef.current === safeFrameVersion) return;
     const width = Math.max(1, safeFrame.width);
     const height = Math.max(1, safeFrame.height);
     if (canvas.width !== width || canvas.height !== height) {
@@ -2023,6 +2057,7 @@ export default function Home() {
       // The opaque fill remains visible until a safe frame is available.
     }
     context.restore();
+    drawnSafeFrameVersionRef.current = safeFrameVersion;
   }, []);
 
   const startRenderAndInferenceLoops = useCallback(() => {
@@ -2043,15 +2078,28 @@ export default function Home() {
         video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
         document.visibilityState !== "visible"
       ) {
-        inferenceRef.current = window.setTimeout(infer, 110);
+        inferenceRef.current = window.setTimeout(
+          infer,
+          INFERENCE_BUSY_RETRY_MS,
+        );
         return;
       }
 
       const sourceWidth = video.videoWidth;
       const sourceHeight = video.videoHeight;
-      const scale = Math.min(1, 640 / Math.max(sourceWidth, sourceHeight));
-      analysisCanvas.width = Math.max(1, Math.round(sourceWidth * scale));
-      analysisCanvas.height = Math.max(1, Math.round(sourceHeight * scale));
+      const scale = Math.min(
+        1,
+        ANALYSIS_MAX_EDGE / Math.max(sourceWidth, sourceHeight),
+      );
+      const analysisWidth = Math.max(1, Math.round(sourceWidth * scale));
+      const analysisHeight = Math.max(1, Math.round(sourceHeight * scale));
+      if (
+        analysisCanvas.width !== analysisWidth ||
+        analysisCanvas.height !== analysisHeight
+      ) {
+        analysisCanvas.width = analysisWidth;
+        analysisCanvas.height = analysisHeight;
+      }
       const analysisContext = analysisCanvas.getContext("2d", {
         alpha: false,
       });
@@ -2097,7 +2145,10 @@ export default function Home() {
           workerBusyRef.current = false;
         }
       }
-      inferenceRef.current = window.setTimeout(infer, 170);
+      inferenceRef.current = window.setTimeout(
+        infer,
+        INFERENCE_TARGET_INTERVAL_MS,
+      );
     };
 
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
@@ -2124,7 +2175,12 @@ export default function Home() {
     pendingInferenceRef.current = null;
     privacySourceCanvasRef.current = null;
     privacySanitizedCanvasRef.current = null;
-    privacyEmptyScanCountRef.current = 0;
+    privacyEmptyVerificationRef.current = {
+      consecutiveEmptyObjectScans: 0,
+      verifiedAt: null,
+    };
+    safeFrameVersionRef.current = 0;
+    drawnSafeFrameVersionRef.current = -1;
     personCountTrackRef.current = null;
     pixelCanvasRef.current = null;
     latestResultRef.current = null;
@@ -2275,8 +2331,9 @@ export default function Home() {
         audio: false,
         video: {
           facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: 960, max: 1280 },
+          height: { ideal: 540, max: 720 },
+          frameRate: { ideal: 24, max: 30 },
         },
       });
       await modelPromise;
@@ -2290,7 +2347,8 @@ export default function Home() {
       if (safeFrame && video.videoWidth > 0 && video.videoHeight > 0) {
         const safeScale = Math.min(
           1,
-          640 / Math.max(video.videoWidth, video.videoHeight),
+          ANALYSIS_MAX_EDGE /
+            Math.max(video.videoWidth, video.videoHeight),
         );
         safeFrame.width = Math.max(
           1,

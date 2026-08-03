@@ -34,12 +34,20 @@ export type PrivacyDecisionInput = {
    * position. Cached object results must not be treated as current regions.
    */
   peopleSpatiallyAligned: boolean;
-  /**
-   * A zero-person frame is verified only when the slower object detector also
-   * ran on this exact frame. Protected people can be published without waiting
-   * for an object refresh.
-   */
+  /** Whether recent exact-frame object scans verified the scene as empty. */
+  emptySceneVerified: boolean;
+};
+
+export type EmptySceneVerificationState = {
+  consecutiveEmptyObjectScans: number;
+  verifiedAt: number | null;
+};
+
+export type EmptySceneVerificationInput = {
+  now: number;
+  sceneEligible: boolean;
   objectUpdated: boolean;
+  requiredScans: number;
 };
 
 export type PrivacyFrameDecision = {
@@ -103,7 +111,7 @@ export function decidePrivacyFrame(
         reason: "person_region_mismatch",
       };
     }
-    if (!input.objectUpdated) {
+    if (!input.emptySceneVerified) {
       return {
         mode: "hold",
         reason: "object_result_pending",
@@ -129,6 +137,42 @@ export function decidePrivacyFrame(
     mode: "sanitize",
     reason: "verified_people_protected",
   };
+}
+
+export function updateEmptySceneVerification(
+  previous: EmptySceneVerificationState,
+  input: EmptySceneVerificationInput,
+): EmptySceneVerificationState {
+  if (!input.sceneEligible || !Number.isFinite(input.now)) {
+    return { consecutiveEmptyObjectScans: 0, verifiedAt: null };
+  }
+  if (!input.objectUpdated) return previous;
+
+  const requiredScans = Math.max(1, Math.floor(input.requiredScans));
+  const consecutiveEmptyObjectScans = Math.min(
+    requiredScans,
+    previous.consecutiveEmptyObjectScans + 1,
+  );
+  return {
+    consecutiveEmptyObjectScans,
+    verifiedAt:
+      consecutiveEmptyObjectScans >= requiredScans
+        ? input.now
+        : previous.verifiedAt,
+  };
+}
+
+export function emptySceneVerificationIsFresh(
+  state: EmptySceneVerificationState,
+  now: number,
+  ttlMs: number,
+) {
+  return Boolean(
+    state.verifiedAt !== null &&
+      Number.isFinite(now) &&
+      now >= state.verifiedAt &&
+      now - state.verifiedAt <= Math.max(0, ttlMs),
+  );
 }
 
 /**
