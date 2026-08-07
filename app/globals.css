@@ -338,6 +338,177 @@ a:focus-visible {
   gap: 9px;
 }
 
+.patrol-source-panel {
+  display: grid;
+  gap: 14px;
+  margin: -4px 0 18px;
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgb(255 255 255 / 78%);
+  box-shadow: var(--shadow-sm);
+}
+
+.patrol-source-row,
+.patrol-source-tabs,
+.patrol-source-summary,
+.fms-security-note,
+.fms-stream-status,
+.fms-track-control {
+  display: flex;
+  align-items: center;
+}
+
+.patrol-source-row {
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.patrol-source-tabs {
+  flex: 0 0 auto;
+  gap: 5px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--paper);
+}
+
+.patrol-source-tabs button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 760;
+}
+
+.patrol-source-tabs button.active {
+  background: var(--ink);
+  color: white;
+  box-shadow: 0 6px 14px rgb(16 42 67 / 12%);
+}
+
+.patrol-source-tabs button.active svg {
+  color: var(--primary-bright);
+}
+
+.patrol-source-tabs button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.patrol-source-summary {
+  min-width: 0;
+  justify-content: flex-end;
+  gap: 9px;
+  text-align: right;
+}
+
+.patrol-source-summary > span {
+  display: grid;
+  gap: 2px;
+}
+
+.patrol-source-summary strong {
+  font-size: 12px;
+}
+
+.patrol-source-summary small {
+  color: var(--ink-soft);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.fms-connect-form {
+  display: grid;
+  grid-template-columns: minmax(170px, 1.1fr) minmax(150px, 1fr) minmax(105px, 0.55fr) auto;
+  gap: 10px;
+  align-items: end;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.fms-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.fms-field input,
+.fms-track-control select {
+  min-width: 0;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 11px;
+  outline: none;
+  background: white;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.fms-field input:focus,
+.fms-track-control select:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgb(37 99 235 / 10%);
+}
+
+.fms-security-note,
+.fms-stream-status {
+  gap: 7px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.fms-security-note {
+  grid-column: 1 / -1;
+}
+
+.fms-security-note svg,
+.fms-stream-status svg {
+  flex: 0 0 auto;
+  color: var(--primary);
+}
+
+.fms-connect-error {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--red-deep);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.fms-connected-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line);
+}
+
+.fms-track-control {
+  gap: 9px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.fms-track-control select {
+  width: min(330px, 46vw);
+}
+
 .button {
   display: inline-flex;
   min-height: 44px;
@@ -1883,6 +2054,57 @@ a:focus-visible {
 
   .heading-actions .button {
     flex: 1;
+  }
+
+  .patrol-source-panel {
+    margin-bottom: 14px;
+    padding: 12px;
+    border-radius: 16px;
+  }
+
+  .patrol-source-row {
+    display: grid;
+    gap: 10px;
+  }
+
+  .patrol-source-tabs {
+    width: 100%;
+  }
+
+  .patrol-source-tabs button {
+    flex: 1;
+    justify-content: center;
+  }
+
+  .patrol-source-summary {
+    justify-content: flex-start;
+    text-align: left;
+  }
+
+  .fms-connect-form {
+    grid-template-columns: 1fr;
+  }
+
+  .fms-connect-form > .button {
+    width: 100%;
+  }
+
+  .fms-security-note,
+  .fms-connect-error {
+    grid-column: auto;
+  }
+
+  .fms-connected-tools {
+    display: grid;
+  }
+
+  .fms-track-control {
+    display: grid;
+    width: 100%;
+  }
+
+  .fms-track-control select {
+    width: 100%;
   }
 
   .camera-card {

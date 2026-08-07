@@ -60,6 +60,12 @@ import {
   type EventRecordingResult,
   type EventRecordingSession,
 } from "./event-recorder";
+import { FmsClient, FmsClientError } from "./fms-client";
+import type {
+  FmsLiveKitVideoSource,
+  FmsLiveKitFeed,
+  FmsLiveKitSourceState,
+} from "./fms-livekit-source";
 import {
   analyzeFallPose,
   createVerificationProgress,
@@ -92,8 +98,13 @@ import {
   type PrivacyFrameDecision,
   updateEmptySceneVerification,
 } from "./privacy-frame";
+import {
+  createVideoFrameGateState,
+  updateVideoFrameGate,
+} from "./video-frame-gate";
 
 type AppView = "patrol" | "history" | "guide";
+type PatrolVideoSource = "device" | "robot";
 type CameraState = "idle" | "starting" | "running" | "error";
 type ModelState = "idle" | "loading" | "ready" | "error";
 type AlertPhase = "idle" | "verifying" | "alerted" | "recovered";
@@ -166,6 +177,10 @@ type BeforeInstallPromptEvent = Event & {
   userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
 };
 
+type VideoWithDecodedFrameMetrics = HTMLVideoElement & {
+  webkitDecodedFrameCount?: number;
+};
+
 type VisionStats = {
   people: number;
   objects: number;
@@ -196,6 +211,8 @@ const PERSON_COUNT_HOLD_MS = 1_050;
 const ANALYSIS_MAX_EDGE = 640;
 const INFERENCE_BUSY_RETRY_MS = 45;
 const INFERENCE_TARGET_INTERVAL_MS = 85;
+const VIDEO_FRAME_STALL_MS = 1_500;
+const SOURCE_SWITCH_WARMUP_RESULTS = 8;
 const STORAGE_KEY = "safebot-safety-events-v1";
 const DEVICE_ID_KEY = "safebot-device-id-v1";
 const MIN_DISPLAY_PERSON_SCORE = 0.62;
@@ -394,8 +411,150 @@ function eventIcon(status: EventStatus) {
   }
 }
 
+function waitForVideoDimensions(
+  video: HTMLVideoElement,
+  timeoutMs = 12_000,
+): Promise<void> {
+  if (video.videoWidth > 0 && video.videoHeight > 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    let timeout = 0;
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      video.removeEventListener("loadedmetadata", onReady);
+      video.removeEventListener("loadeddata", onReady);
+      video.removeEventListener("resize", onReady);
+    };
+    const onReady = () => {
+      if (video.videoWidth <= 0 || video.videoHeight <= 0) return;
+      cleanup();
+      resolve();
+    };
+    timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("영상의 첫 화면을 받지 못했습니다."));
+    }, timeoutMs);
+    video.addEventListener("loadedmetadata", onReady);
+    video.addEventListener("loadeddata", onReady);
+    video.addEventListener("resize", onReady);
+  });
+}
+
+function waitForPlayback(
+  video: HTMLVideoElement,
+  timeoutMs = 12_000,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(
+      () => reject(new Error("영상 재생을 시작하지 못했습니다.")),
+      timeoutMs,
+    );
+    let playback: Promise<void>;
+    try {
+      playback = video.play();
+    } catch {
+      window.clearTimeout(timeout);
+      reject(new Error("영상 재생을 시작하지 못했습니다."));
+      return;
+    }
+    void playback.then(
+      () => {
+        window.clearTimeout(timeout);
+        resolve();
+      },
+      () => {
+        window.clearTimeout(timeout);
+        reject(new Error("영상 재생을 시작하지 못했습니다."));
+      },
+    );
+  });
+}
+
+function waitForFirstDecodedFrame(
+  video: HTMLVideoElement,
+  isCurrent?: () => boolean,
+  timeoutMs = 12_000,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let frameCallbackId: number | null = null;
+    let pollTimeout = 0;
+    const initialDecodedFrames = decodedFrameCount(video) ?? 0;
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      window.clearTimeout(pollTimeout);
+      if (frameCallbackId !== null) {
+        try {
+          video.cancelVideoFrameCallback(frameCallbackId);
+        } catch {
+          // The source may have detached while the first frame was pending.
+        }
+      }
+    };
+    const complete = () => {
+      if (isCurrent && !isCurrent()) {
+        cleanup();
+        reject(new Error("영상 소스가 변경되었습니다."));
+        return;
+      }
+      cleanup();
+      resolve();
+    };
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("영상의 첫 화면을 받지 못했습니다."));
+    }, timeoutMs);
+
+    if ("requestVideoFrameCallback" in video) {
+      frameCallbackId = video.requestVideoFrameCallback(complete);
+      return;
+    }
+
+    const pollDecodedFrames = () => {
+      if (isCurrent && !isCurrent()) {
+        cleanup();
+        reject(new Error("영상 소스가 변경되었습니다."));
+        return;
+      }
+      const currentDecodedFrames = decodedFrameCount(video);
+      if (
+        currentDecodedFrames !== null &&
+        currentDecodedFrames > initialDecodedFrames
+      ) {
+        complete();
+        return;
+      }
+      pollTimeout = window.setTimeout(pollDecodedFrames, 50);
+    };
+    pollDecodedFrames();
+  });
+}
+
+function decodedFrameCount(video: HTMLVideoElement): number | null {
+  try {
+    const quality = video.getVideoPlaybackQuality?.();
+    if (
+      quality &&
+      Number.isFinite(quality.totalVideoFrames) &&
+      quality.totalVideoFrames >= 0
+    ) {
+      return quality.totalVideoFrames;
+    }
+  } catch {
+    // Continue to the WebKit decoded-frame counter when available.
+  }
+  const webkitCount = (video as VideoWithDecodedFrameMetrics)
+    .webkitDecodedFrameCount;
+  return typeof webkitCount === "number" && Number.isFinite(webkitCount)
+    ? Math.max(0, webkitCount)
+    : null;
+}
+
 export default function Home() {
   const [view, setView] = useState<AppView>("patrol");
+  const [patrolSource, setPatrolSource] =
+    useState<PatrolVideoSource>("device");
   const [cameraState, setCameraState] = useState<CameraState>("idle");
   const [modelState, setModelState] = useState<ModelState>("idle");
   const [modelMessage, setModelMessage] = useState(
@@ -431,6 +590,17 @@ export default function Home() {
   const [controlLoginBusy, setControlLoginBusy] = useState(false);
   const [liveBroadcast, setLiveBroadcast] =
     useState<LiveBroadcastSnapshot>(IDLE_LIVE_BROADCAST);
+  const [fmsEmail, setFmsEmail] = useState("");
+  const [fmsPassword, setFmsPassword] = useState("");
+  const [fmsRobotId, setFmsRobotId] = useState("107");
+  const [fmsConnectionMessage, setFmsConnectionMessage] = useState(
+    "ROBOTIS FMS 계정은 이 접속 동안 브라우저 메모리에서만 사용됩니다.",
+  );
+  const [fmsConnectionError, setFmsConnectionError] = useState("");
+  const [fmsStreamState, setFmsStreamState] =
+    useState<FmsLiveKitSourceState>("waiting");
+  const [fmsFeeds, setFmsFeeds] = useState<readonly FmsLiveKitFeed[]>([]);
+  const [selectedFmsFeedId, setSelectedFmsFeedId] = useState("");
   const [selectedClip, setSelectedClip] = useState<{
     event: SafetyEvent;
     url: string;
@@ -458,6 +628,16 @@ export default function Home() {
   const workerBusyRef = useRef(false);
   const pendingInferenceRef = useRef<PendingInferenceFrame | null>(null);
   const cameraGenerationRef = useRef(0);
+  const videoFrameGateRef = useRef(createVideoFrameGateState());
+  const decodedFrameSequenceRef = useRef(0);
+  const videoFrameCallbackRef = useRef<number | null>(null);
+  const videoFrameCallbackVideoRef = useRef<HTMLVideoElement | null>(null);
+  const fallWarmupResultsRef = useRef(SOURCE_SWITCH_WARMUP_RESULTS);
+  const patrolSourceRef = useRef<PatrolVideoSource>("device");
+  const fmsLiveKitSourceRef = useRef<FmsLiveKitVideoSource | null>(null);
+  const fmsClientRef = useRef<FmsClient | null>(null);
+  const fmsAbortRef = useRef<AbortController | null>(null);
+  const fmsSessionGenerationRef = useRef(0);
   const latestResultRef = useRef<VisionResult | null>(null);
   const visionStatsRef = useRef<VisionStats>({
     people: 0,
@@ -502,9 +682,28 @@ export default function Home() {
     toastTimerRef.current = setTimeout(() => setToast(null), 3200);
   }, []);
 
+  useEffect(() => {
+    patrolSourceRef.current = patrolSource;
+  }, [patrolSource]);
+
   const setPhase = useCallback((phase: AlertPhase) => {
     alertPhaseRef.current = phase;
     setAlertPhase(phase);
+  }, []);
+
+  const cancelVideoFrameTracking = useCallback(() => {
+    const video = videoFrameCallbackVideoRef.current;
+    const callbackId = videoFrameCallbackRef.current;
+    if (video && callbackId !== null) {
+      try {
+        video.cancelVideoFrameCallback(callbackId);
+      } catch {
+        // The source may already have detached the video track.
+      }
+    }
+    videoFrameCallbackRef.current = null;
+    videoFrameCallbackVideoRef.current = null;
+    decodedFrameSequenceRef.current = 0;
   }, []);
 
   const captureSnapshot = useCallback(() => {
@@ -1120,6 +1319,14 @@ export default function Home() {
       visionStatsRef.current = nextVisionStats;
       setVisionStats(nextVisionStats);
 
+      if (fallWarmupResultsRef.current > 0) {
+        fallWarmupResultsRef.current -= 1;
+        suspectStartedRef.current = null;
+        suspectLastPositiveRef.current = null;
+        suspectSamplesRef.current = 0;
+        suspectCandidateRef.current = null;
+        return;
+      }
       if (manualScenarioRef.current) return;
 
       const now = performance.now();
@@ -1257,6 +1464,15 @@ export default function Home() {
     pendingLiveBroadcastAfterLoginRef.current = false;
     pendingInferenceRef.current = null;
     workerBusyRef.current = false;
+    cancelVideoFrameTracking();
+    fmsSessionGenerationRef.current += 1;
+    fmsAbortRef.current?.abort();
+    fmsAbortRef.current = null;
+    fmsClientRef.current?.clearSession();
+    fmsClientRef.current = null;
+    const fmsSource = fmsLiveKitSourceRef.current;
+    fmsLiveKitSourceRef.current = null;
+    void fmsSource?.disconnect();
 
     if (animationRef.current) {
       cancelAnimationFrame(animationRef.current);
@@ -1281,6 +1497,11 @@ export default function Home() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
+    setFmsEmail("");
+    setFmsPassword("");
+    setFmsFeeds([]);
+    setSelectedFmsFeedId("");
+    setFmsStreamState("error");
 
     const recordingCanvas = recordingCanvasRef.current;
     const recordingContext = recordingCanvas?.getContext("2d", {
@@ -1301,7 +1522,7 @@ export default function Home() {
     recordingSessionRef.current = null;
     setRecordingState("failed");
     setCameraState("error");
-  }, []);
+  }, [cancelVideoFrameTracking]);
 
   useEffect(() => {
     if (alertPhase !== "verifying" && alertPhase !== "alerted") return;
@@ -2061,6 +2282,32 @@ export default function Home() {
   }, []);
 
   const startRenderAndInferenceLoops = useCallback(() => {
+    cancelVideoFrameTracking();
+    const trackedVideo = videoRef.current;
+    decodedFrameSequenceRef.current = 0;
+    videoFrameGateRef.current = {
+      lastFrameSequence: 0,
+      lastFrameAt: performance.now(),
+      stalled: false,
+    };
+    if (trackedVideo && "requestVideoFrameCallback" in trackedVideo) {
+      videoFrameCallbackVideoRef.current = trackedVideo;
+      const observeDecodedFrame = (
+        _now: DOMHighResTimeStamp,
+        metadata: VideoFrameCallbackMetadata,
+      ) => {
+        if (videoFrameCallbackVideoRef.current !== trackedVideo) return;
+        decodedFrameSequenceRef.current = Math.max(
+          decodedFrameSequenceRef.current + 1,
+          Math.floor(metadata.presentedFrames),
+        );
+        videoFrameCallbackRef.current =
+          trackedVideo.requestVideoFrameCallback(observeDecodedFrame);
+      };
+      videoFrameCallbackRef.current =
+        trackedVideo.requestVideoFrameCallback(observeDecodedFrame);
+    }
+
     const render = () => {
       drawCanvasFrame();
       animationRef.current = requestAnimationFrame(render);
@@ -2083,6 +2330,60 @@ export default function Home() {
           INFERENCE_BUSY_RETRY_MS,
         );
         return;
+      }
+
+      if (videoFrameCallbackVideoRef.current !== video) {
+        const fallbackCount = decodedFrameCount(video);
+        if (fallbackCount !== null) {
+          decodedFrameSequenceRef.current = Math.max(
+            decodedFrameSequenceRef.current,
+            fallbackCount,
+          );
+        }
+      }
+      const frameGate = updateVideoFrameGate(videoFrameGateRef.current, {
+        frameSequence: decodedFrameSequenceRef.current,
+        now: performance.now(),
+        stallAfterMs: VIDEO_FRAME_STALL_MS,
+      });
+      videoFrameGateRef.current = frameGate.state;
+      if (frameGate.justStalled) {
+        cameraGenerationRef.current += 1;
+        latestResultRef.current = null;
+        personCountTrackRef.current = null;
+        privacyEmptyVerificationRef.current = {
+          consecutiveEmptyObjectScans: 0,
+          verifiedAt: null,
+        };
+        worker.postMessage({ type: "reset" });
+        writeOpaqueRecordingFrame();
+        setPrivacyFrameHeld(true);
+        setModelMessage(
+          patrolSourceRef.current === "robot"
+            ? "로봇 영상이 멈춰 감지를 일시 중단했습니다. 재연결을 기다립니다."
+            : "카메라 프레임이 멈춰 감지를 일시 중단했습니다.",
+        );
+        if (alertPhaseRef.current === "verifying") {
+          resolveVerification("interrupted");
+        }
+      }
+      if (!frameGate.shouldAnalyze) {
+        inferenceRef.current = window.setTimeout(
+          infer,
+          INFERENCE_BUSY_RETRY_MS,
+        );
+        return;
+      }
+      if (frameGate.justResumed) {
+        cameraGenerationRef.current += 1;
+        fallWarmupResultsRef.current = SOURCE_SWITCH_WARMUP_RESULTS;
+        privacyEmptyVerificationRef.current = {
+          consecutiveEmptyObjectScans: 0,
+          verifiedAt: null,
+        };
+        worker.postMessage({ type: "reset" });
+        setPrivacyFrameHeld(false);
+        setModelMessage("AI 익명화와 자세 분석이 기기에서 실행 중입니다.");
       }
 
       const sourceWidth = video.videoWidth;
@@ -2155,9 +2456,15 @@ export default function Home() {
     if (inferenceRef.current) window.clearTimeout(inferenceRef.current);
     render();
     void infer();
-  }, [drawCanvasFrame]);
+  }, [
+    cancelVideoFrameTracking,
+    drawCanvasFrame,
+    resolveVerification,
+    writeOpaqueRecordingFrame,
+  ]);
 
   const stopLoops = useCallback(() => {
+    cancelVideoFrameTracking();
     if (animationRef.current) {
       cancelAnimationFrame(animationRef.current);
       animationRef.current = null;
@@ -2168,11 +2475,12 @@ export default function Home() {
     }
     pendingInferenceRef.current = null;
     workerBusyRef.current = false;
-  }, []);
+  }, [cancelVideoFrameTracking]);
 
   const resetPrivacyFramePipeline = useCallback(() => {
     cameraGenerationRef.current += 1;
     pendingInferenceRef.current = null;
+    videoFrameGateRef.current = createVideoFrameGateState();
     privacySourceCanvasRef.current = null;
     privacySanitizedCanvasRef.current = null;
     privacyEmptyVerificationRef.current = {
@@ -2184,6 +2492,8 @@ export default function Home() {
     personCountTrackRef.current = null;
     pixelCanvasRef.current = null;
     latestResultRef.current = null;
+    fallWarmupResultsRef.current = SOURCE_SWITCH_WARMUP_RESULTS;
+    workerRef.current?.postMessage({ type: "reset" });
 
     const analysisCanvas = analysisCanvasRef.current;
     if (analysisCanvas) {
@@ -2211,6 +2521,60 @@ export default function Home() {
       }
     }
   }, [writeOpaqueRecordingFrame]);
+
+  const beginAnalysisForStream = useCallback(
+    async (
+      stream: MediaStream,
+      expectedFmsGeneration?: number,
+      isCurrentAttachment?: () => boolean,
+    ): Promise<boolean> => {
+      const video = videoRef.current;
+      if (!video) throw new Error("영상 화면을 준비하지 못했습니다.");
+      if (
+        expectedFmsGeneration !== undefined &&
+        expectedFmsGeneration !== fmsSessionGenerationRef.current
+      ) {
+        return false;
+      }
+      if (isCurrentAttachment && !isCurrentAttachment()) return false;
+
+      streamRef.current = stream;
+      if (video.srcObject !== stream) video.srcObject = stream;
+      await waitForPlayback(video);
+      if (isCurrentAttachment && !isCurrentAttachment()) return false;
+      await waitForVideoDimensions(video);
+      if (
+        expectedFmsGeneration !== undefined &&
+        expectedFmsGeneration !== fmsSessionGenerationRef.current
+      ) {
+        return false;
+      }
+      if (isCurrentAttachment && !isCurrentAttachment()) return false;
+      await waitForFirstDecodedFrame(video, isCurrentAttachment);
+      if (isCurrentAttachment && !isCurrentAttachment()) return false;
+
+      const safeFrame = recordingCanvasRef.current;
+      if (safeFrame) {
+        const safeScale = Math.min(
+          1,
+          ANALYSIS_MAX_EDGE / Math.max(video.videoWidth, video.videoHeight),
+        );
+        safeFrame.width = Math.max(
+          1,
+          Math.round(video.videoWidth * safeScale),
+        );
+        safeFrame.height = Math.max(
+          1,
+          Math.round(video.videoHeight * safeScale),
+        );
+        writeOpaqueRecordingFrame();
+      }
+      setCameraState("running");
+      startRenderAndInferenceLoops();
+      return true;
+    },
+    [startRenderAndInferenceLoops, writeOpaqueRecordingFrame],
+  );
 
   const stopLiveBroadcast = useCallback(
     (notify = false) => {
@@ -2280,10 +2644,28 @@ export default function Home() {
       stopLiveBroadcast();
       stopLoops();
       resetPrivacyFramePipeline();
+      fmsSessionGenerationRef.current += 1;
+      fmsAbortRef.current?.abort();
+      fmsAbortRef.current = null;
+      fmsClientRef.current?.clearSession();
+      fmsClientRef.current = null;
+      const fmsSource = fmsLiveKitSourceRef.current;
+      fmsLiveKitSourceRef.current = null;
+      void fmsSource?.disconnect();
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       if (videoRef.current) videoRef.current.srcObject = null;
       setCameraState("idle");
+      setFmsEmail("");
+      setFmsPassword("");
+      setFmsFeeds([]);
+      setSelectedFmsFeedId("");
+      setFmsStreamState("waiting");
+      if (patrolSourceRef.current === "robot") {
+        setFmsConnectionMessage(
+          "연결이 종료되었습니다. 계정과 FMS 토큰은 브라우저 메모리에서 삭제했습니다.",
+        );
+      }
       const emptyVisionStats = {
         people: 0,
         objects: 0,
@@ -2299,7 +2681,13 @@ export default function Home() {
       ) {
         resolveVerification("interrupted");
       }
-      if (reason === "user") showToast("카메라 순찰을 종료했습니다.");
+      if (reason === "user") {
+        showToast(
+          patrolSourceRef.current === "robot"
+            ? "로봇 영상 AI 감지를 종료했습니다."
+            : "카메라 순찰을 종료했습니다.",
+        );
+      }
     },
     [
       resetPrivacyFramePipeline,
@@ -2323,10 +2711,26 @@ export default function Home() {
     }
 
     resetPrivacyFramePipeline();
+    setFmsEmail("");
+    setFmsPassword("");
+    setFmsConnectionError("");
+    setFmsFeeds([]);
+    setSelectedFmsFeedId("");
+    const localStartGeneration = cameraGenerationRef.current;
+    fmsSessionGenerationRef.current += 1;
+    fmsAbortRef.current?.abort();
+    fmsAbortRef.current = null;
+    fmsClientRef.current?.clearSession();
+    fmsClientRef.current = null;
+    const previousFmsSource = fmsLiveKitSourceRef.current;
+    fmsLiveKitSourceRef.current = null;
+    void previousFmsSource?.disconnect();
+    deviceIdRef.current = "모바일 순찰 01";
     setCameraState("starting");
     let requestedStream: MediaStream | null = null;
     try {
       const modelPromise = ensureVisionWorker();
+      void modelPromise.catch(() => undefined);
       requestedStream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: {
@@ -2337,34 +2741,16 @@ export default function Home() {
         },
       });
       await modelPromise;
-      streamRef.current = requestedStream;
-
-      const video = videoRef.current;
-      if (!video) throw new Error("Video element unavailable");
-      video.srcObject = requestedStream;
-      await video.play();
-      const safeFrame = recordingCanvasRef.current;
-      if (safeFrame && video.videoWidth > 0 && video.videoHeight > 0) {
-        const safeScale = Math.min(
-          1,
-          ANALYSIS_MAX_EDGE /
-            Math.max(video.videoWidth, video.videoHeight),
-        );
-        safeFrame.width = Math.max(
-          1,
-          Math.round(video.videoWidth * safeScale),
-        );
-        safeFrame.height = Math.max(
-          1,
-          Math.round(video.videoHeight * safeScale),
-        );
-        writeOpaqueRecordingFrame();
-      }
-      setCameraState("running");
-      startRenderAndInferenceLoops();
+      const activated = await beginAnalysisForStream(
+        requestedStream,
+        undefined,
+        () => localStartGeneration === cameraGenerationRef.current,
+      );
+      if (!activated) return;
       showToast("기기 안에서 AI 순찰을 시작했습니다.");
     } catch (error) {
       requestedStream?.getTracks().forEach((track) => track.stop());
+      if (localStartGeneration !== cameraGenerationRef.current) return;
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       setCameraState("error");
@@ -2381,12 +2767,295 @@ export default function Home() {
       }
     }
   }, [
+    beginAnalysisForStream,
     ensureVisionWorker,
     resetPrivacyFramePipeline,
     showToast,
-    startRenderAndInferenceLoops,
-    writeOpaqueRecordingFrame,
   ]);
+
+  const startRobotStream = useCallback(
+    async (event?: FormEvent<HTMLFormElement>) => {
+      event?.preventDefault();
+      const email = fmsEmail.trim();
+      const password = fmsPassword;
+      const robotId = fmsRobotId.trim();
+      if (!email || !password) {
+        setFmsConnectionError("FMS 이메일과 비밀번호를 입력해 주세요.");
+        return;
+      }
+      if (!/^\d{1,64}$/u.test(robotId)) {
+        setFmsConnectionError("로봇 번호는 숫자로 입력해 주세요.");
+        return;
+      }
+
+      stopLiveBroadcast();
+      stopLoops();
+      resetPrivacyFramePipeline();
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      if (videoRef.current) videoRef.current.srcObject = null;
+
+      fmsSessionGenerationRef.current += 1;
+      const generation = fmsSessionGenerationRef.current;
+      fmsAbortRef.current?.abort();
+      fmsClientRef.current?.clearSession();
+      const previousSource = fmsLiveKitSourceRef.current;
+      fmsLiveKitSourceRef.current = null;
+      void previousSource?.disconnect();
+
+      const abortController = new AbortController();
+      fmsAbortRef.current = abortController;
+      const client = new FmsClient();
+      fmsClientRef.current = client;
+      setFmsConnectionError("");
+      setFmsFeeds([]);
+      setSelectedFmsFeedId("");
+      setFmsStreamState("connecting");
+      setFmsConnectionMessage("FMS 계정을 확인하고 로봇 영상 권한을 요청합니다.");
+      setModelMessage("로봇 영상과 기기 내 AI 모델을 함께 준비하고 있습니다.");
+      setCameraState("starting");
+
+      const modelPromise = ensureVisionWorker();
+      void modelPromise.catch(() => undefined);
+      let firstStreamResolved = false;
+      let firstAnalysisStarted = false;
+      let attachmentGeneration = 0;
+      let resolveFirstStream: () => void = () => {};
+      const firstStreamReady = new Promise<void>((resolve) => {
+        resolveFirstStream = resolve;
+      });
+      let firstStreamTimeout = 0;
+
+      try {
+        await client.login(
+          { email, password },
+          { signal: abortController.signal },
+        );
+        setFmsPassword("");
+        const profile = await client.getProfile({
+          signal: abortController.signal,
+        });
+        const sessionSuffix = window.crypto.randomUUID
+          ? window.crypto.randomUUID().slice(0, 12)
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        const participantIdentity =
+          `${profile.uid.slice(0, 220)}-safebot-${sessionSuffix}`.slice(0, 256);
+        const connection = await client.requestLiveKitToken(
+          { robotId, participantIdentity },
+          { signal: abortController.signal },
+        );
+        client.clearSession();
+        if (fmsClientRef.current === client) fmsClientRef.current = null;
+        if (generation !== fmsSessionGenerationRef.current) return;
+
+        const fmsVideo = videoRef.current;
+        if (!fmsVideo) throw new Error("영상 화면을 준비하지 못했습니다.");
+        const { FmsLiveKitVideoSource } = await import(
+          "./fms-livekit-source"
+        );
+        if (generation !== fmsSessionGenerationRef.current) return;
+        const source = new FmsLiveKitVideoSource({
+          video: fmsVideo,
+          onFeeds: (feeds) => {
+            if (generation !== fmsSessionGenerationRef.current) return;
+            setFmsFeeds(feeds);
+            setSelectedFmsFeedId(
+              feeds.find((feed) => feed.selected)?.id ?? "",
+            );
+          },
+          onState: (state) => {
+            if (generation !== fmsSessionGenerationRef.current) return;
+            setFmsStreamState(state);
+            if (state === "connecting") {
+              setFmsConnectionMessage("Robot FMS 실시간 영상방에 연결 중입니다.");
+            } else if (state === "waiting") {
+              setFmsConnectionMessage(
+                "영상 트랙을 기다리고 있습니다. 재생이 차단됐다면 재생 버튼을 눌러 주세요.",
+              );
+            } else if (state === "live") {
+              setFmsConnectionMessage(
+                `Robot-${robotId} 영상을 SAFEBOT이 직접 받아 분석 중입니다.`,
+              );
+            } else if (state === "reconnecting") {
+              setFmsConnectionMessage(
+                "FMS 영상이 끊겨 자동으로 다시 연결하고 있습니다.",
+              );
+            } else {
+              attachmentGeneration += 1;
+              fmsSessionGenerationRef.current += 1;
+              const erroredSource = fmsLiveKitSourceRef.current;
+              fmsLiveKitSourceRef.current = null;
+              void erroredSource?.disconnect();
+              stopLiveBroadcast();
+              stopLoops();
+              resetPrivacyFramePipeline();
+              streamRef.current = null;
+              setFmsEmail("");
+              setFmsPassword("");
+              setCameraState("error");
+              setFmsConnectionError(
+                "FMS 실시간 연결이 종료되었습니다. 다시 연결해 주세요.",
+              );
+              setModelMessage(
+                "원격 영상 연결이 종료되어 AI 감지를 안전하게 중단했습니다.",
+              );
+              if (alertPhaseRef.current === "verifying") {
+                resolveVerification("interrupted");
+              }
+            }
+          },
+          onMediaStream: (stream) => {
+            if (generation !== fmsSessionGenerationRef.current) return;
+            if (!stream) {
+              attachmentGeneration += 1;
+              stopLoops();
+              streamRef.current = null;
+              resetPrivacyFramePipeline();
+              setCameraState("starting");
+              if (alertPhaseRef.current === "verifying") {
+                resolveVerification("interrupted");
+              }
+              return;
+            }
+            const attachment = ++attachmentGeneration;
+            const attachmentIsCurrent = () =>
+              generation === fmsSessionGenerationRef.current &&
+              attachment === attachmentGeneration;
+
+            if (!firstStreamResolved) {
+              firstStreamResolved = true;
+              resolveFirstStream();
+            }
+
+            void (async () => {
+              try {
+                await modelPromise;
+                if (!attachmentIsCurrent()) return;
+                resetPrivacyFramePipeline();
+                deviceIdRef.current = `고양 폴리봇 ${robotId}`;
+                const activated = await beginAnalysisForStream(
+                  stream,
+                  generation,
+                  attachmentIsCurrent,
+                );
+                if (!activated) return;
+                setFmsConnectionError("");
+                setModelMessage(
+                  "FMS 로봇 영상을 브라우저에서 익명화하고 자세를 분석 중입니다.",
+                );
+                if (!firstAnalysisStarted) {
+                  firstAnalysisStarted = true;
+                  showToast(
+                    `Robot-${robotId} 실시간 영상에서 AI 감지를 시작했습니다.`,
+                  );
+                }
+              } catch (streamError) {
+                if (!attachmentIsCurrent()) return;
+                attachmentGeneration += 1;
+                fmsSessionGenerationRef.current += 1;
+                const failedSource = fmsLiveKitSourceRef.current;
+                fmsLiveKitSourceRef.current = null;
+                void failedSource?.disconnect();
+                stopLiveBroadcast();
+                streamRef.current = null;
+                stopLoops();
+                resetPrivacyFramePipeline();
+                setFmsEmail("");
+                setFmsPassword("");
+                setCameraState("error");
+                setFmsStreamState("error");
+                const message =
+                  streamError instanceof Error && streamError.message
+                    ? streamError.message
+                    : "로봇 영상을 AI 분석 화면에 연결하지 못했습니다.";
+                setFmsConnectionError(message);
+                setModelMessage(message);
+                if (alertPhaseRef.current === "verifying") {
+                  resolveVerification("interrupted");
+                }
+              }
+            })();
+          },
+        });
+        fmsLiveKitSourceRef.current = source;
+        await source.connect({ url: connection.url, token: connection.token });
+        firstStreamTimeout = window.setTimeout(resolveFirstStream, 20_000);
+        await firstStreamReady;
+        window.clearTimeout(firstStreamTimeout);
+        if (!firstStreamResolved) {
+          throw new Error("로봇이 송출하는 영상 트랙을 찾지 못했습니다.");
+        }
+      } catch (error) {
+        window.clearTimeout(firstStreamTimeout);
+        client.clearSession();
+        if (fmsClientRef.current === client) fmsClientRef.current = null;
+        setFmsEmail("");
+        setFmsPassword("");
+        if (generation !== fmsSessionGenerationRef.current) return;
+        fmsSessionGenerationRef.current += 1;
+        attachmentGeneration += 1;
+        const source = fmsLiveKitSourceRef.current;
+        fmsLiveKitSourceRef.current = null;
+        void source?.disconnect();
+        streamRef.current = null;
+        if (videoRef.current) videoRef.current.srcObject = null;
+        stopLiveBroadcast();
+        stopLoops();
+        resetPrivacyFramePipeline();
+        setCameraState("error");
+        setFmsStreamState("error");
+        const message =
+          error instanceof FmsClientError
+            ? error.message
+            : error instanceof Error && error.message
+              ? error.message
+              : "FMS 로봇 영상에 연결하지 못했습니다.";
+        setFmsConnectionError(message);
+        setFmsConnectionMessage(
+          "운행·경로 설정은 변경하지 않았습니다. FMS 영상 수신만 중단되었습니다.",
+        );
+        setModelMessage(message);
+      } finally {
+        if (fmsAbortRef.current === abortController) {
+          fmsAbortRef.current = null;
+        }
+      }
+    },
+    [
+      beginAnalysisForStream,
+      ensureVisionWorker,
+      fmsEmail,
+      fmsPassword,
+      fmsRobotId,
+      resetPrivacyFramePipeline,
+      resolveVerification,
+      showToast,
+      stopLiveBroadcast,
+      stopLoops,
+    ],
+  );
+
+  const selectFmsFeed = useCallback(
+    (feedId: string) => {
+      if (!feedId || !fmsLiveKitSourceRef.current) return;
+      stopLoops();
+      resetPrivacyFramePipeline();
+      setCameraState("starting");
+      if (!fmsLiveKitSourceRef.current.selectFeed(feedId)) {
+        setFmsConnectionError("선택한 로봇 카메라를 찾지 못했습니다.");
+      }
+    },
+    [resetPrivacyFramePipeline, stopLoops],
+  );
+
+  const resumeFmsVideo = useCallback(async () => {
+    const resumed = await fmsLiveKitSourceRef.current?.resumeVideo();
+    if (!resumed) {
+      setFmsConnectionError(
+        "영상 재생을 시작하지 못했습니다. 화면을 한 번 누른 뒤 다시 시도해 주세요.",
+      );
+    }
+  }, []);
 
   const enableNotifications = useCallback(async () => {
     if (!("Notification" in window)) {
@@ -2703,7 +3372,12 @@ export default function Home() {
     const onVisibilityChange = () => {
       if (
         document.visibilityState === "hidden" &&
-        streamRef.current
+        (streamRef.current ||
+          cameraState === "starting" ||
+          fmsAbortRef.current ||
+          fmsLiveKitSourceRef.current ||
+          fmsEmail.length > 0 ||
+          fmsPassword.length > 0)
       ) {
         stopCamera("background");
         showToast(
@@ -2714,13 +3388,18 @@ export default function Home() {
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () =>
       document.removeEventListener("visibilitychange", onVisibilityChange);
-  }, [showToast, stopCamera]);
+  }, [cameraState, fmsEmail, fmsPassword, showToast, stopCamera]);
 
   useEffect(
     () => () => {
       liveBroadcastSenderRef.current?.dispose();
       liveBroadcastSenderRef.current = null;
       stopLoops();
+      fmsSessionGenerationRef.current += 1;
+      fmsAbortRef.current?.abort();
+      fmsClientRef.current?.clearSession();
+      void fmsLiveKitSourceRef.current?.disconnect();
+      fmsLiveKitSourceRef.current = null;
       streamRef.current?.getTracks().forEach((track) => track.stop());
       workerRef.current?.terminate();
       void recordingSessionRef.current?.discard();
@@ -2754,12 +3433,24 @@ export default function Home() {
 
   const cameraStatusLabel =
     cameraState === "running"
-      ? "AI 순찰 중"
+      ? patrolSource === "robot"
+        ? "로봇 AI 감지 중"
+        : "AI 순찰 중"
       : cameraState === "starting"
         ? "연결 중"
         : cameraState === "error"
           ? "확인 필요"
           : "대기 중";
+  const fmsStatusLabel =
+    fmsStreamState === "live"
+      ? "실시간 수신 중"
+      : fmsStreamState === "connecting"
+        ? "FMS 연결 중"
+        : fmsStreamState === "reconnecting"
+          ? "자동 재연결 중"
+          : fmsStreamState === "error"
+            ? "연결 확인 필요"
+            : "영상 대기 중";
   const liveBroadcastActive =
     liveBroadcast.state === "connecting" ||
     liveBroadcast.state === "live" ||
@@ -2926,36 +3617,206 @@ export default function Home() {
                           : "연결 후 실시간 공유"}
                     </button>
                   )}
-                  {cameraState === "running" ? (
+                  {cameraState === "running" || cameraState === "starting" ? (
                     <button
                       className="button button-danger-soft"
                       onClick={() => stopCamera("user")}
                     >
                       <CameraOff size={17} aria-hidden="true" />
-                      순찰 종료
+                      {cameraState === "starting" ? "연결 취소" : "순찰 종료"}
                     </button>
                   ) : (
                     <button
                       className="button button-primary"
-                      onClick={startCamera}
-                      disabled={cameraState === "starting"}
+                      onClick={
+                        patrolSource === "robot"
+                          ? () => void startRobotStream()
+                          : startCamera
+                      }
                     >
-                      {cameraState === "starting" ? (
-                        <Activity
-                          className="spin"
-                          size={17}
-                          aria-hidden="true"
-                        />
-                      ) : (
-                        <Camera size={17} aria-hidden="true" />
-                      )}
-                      {cameraState === "starting"
-                        ? "AI 준비 중"
+                      <Camera size={17} aria-hidden="true" />
+                      {patrolSource === "robot"
+                        ? "로봇 영상 AI 감지"
                         : "폴리봇 AI 감지 시작"}
                     </button>
                   )}
                 </div>
               </div>
+
+              <section
+                className="patrol-source-panel"
+                aria-label="순찰 영상 입력 선택"
+              >
+                <div className="patrol-source-row">
+                  <div
+                    className="patrol-source-tabs"
+                    role="group"
+                    aria-label="영상 입력 방식"
+                  >
+                    <button
+                      type="button"
+                      className={patrolSource === "device" ? "active" : ""}
+                      onClick={() => {
+                        setPatrolSource("device");
+                        setFmsEmail("");
+                        setFmsPassword("");
+                        setFmsConnectionError("");
+                        setModelMessage(
+                          "카메라를 켜면 AI 모델을 준비합니다.",
+                        );
+                      }}
+                      disabled={
+                        cameraState === "starting" || cameraState === "running"
+                      }
+                    >
+                      <Smartphone size={16} aria-hidden="true" />
+                      휴대폰 카메라
+                    </button>
+                    <button
+                      type="button"
+                      className={patrolSource === "robot" ? "active" : ""}
+                      onClick={() => {
+                        setPatrolSource("robot");
+                        setFmsConnectionError("");
+                        setModelMessage(
+                          "FMS 계정을 입력하면 로봇 영상을 받아 AI 분석합니다.",
+                        );
+                      }}
+                      disabled={
+                        cameraState === "starting" || cameraState === "running"
+                      }
+                    >
+                      <Bot size={16} aria-hidden="true" />
+                      로봇 FMS 영상
+                    </button>
+                  </div>
+                  <div className="patrol-source-summary">
+                    {patrolSource === "robot" ? (
+                      <Video size={18} aria-hidden="true" />
+                    ) : (
+                      <Camera size={18} aria-hidden="true" />
+                    )}
+                    <span>
+                      <strong>
+                        {patrolSource === "robot"
+                          ? "외부 영상 수신 · 별도 AI 분석"
+                          : "현장 촬영 · 기기 내 AI 분석"}
+                      </strong>
+                      <small>
+                        {patrolSource === "robot"
+                          ? "FMS 운행·경로·카메라 설정은 변경하지 않습니다."
+                          : "휴대폰 후면 카메라를 현장 프로토타입으로 사용합니다."}
+                      </small>
+                    </span>
+                  </div>
+                </div>
+
+                {patrolSource === "robot" &&
+                  cameraState !== "running" &&
+                  cameraState !== "starting" && (
+                    <form
+                      className="fms-connect-form"
+                      onSubmit={startRobotStream}
+                      autoComplete="off"
+                    >
+                      <label className="fms-field">
+                        FMS 이메일
+                        <input
+                          type="email"
+                          inputMode="email"
+                          autoCapitalize="none"
+                          autoCorrect="off"
+                          autoComplete="off"
+                          value={fmsEmail}
+                          onChange={(event) => setFmsEmail(event.target.value)}
+                          placeholder="FMS 로그인 이메일"
+                          required
+                        />
+                      </label>
+                      <label className="fms-field">
+                        FMS 비밀번호
+                        <input
+                          type="password"
+                          autoComplete="off"
+                          value={fmsPassword}
+                          onChange={(event) =>
+                            setFmsPassword(event.target.value)
+                          }
+                          placeholder="이 접속에서만 사용"
+                          required
+                        />
+                      </label>
+                      <label className="fms-field">
+                        로봇 번호
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          pattern="[0-9]+"
+                          value={fmsRobotId}
+                          onChange={(event) => setFmsRobotId(event.target.value)}
+                          aria-label="FMS 로봇 번호"
+                          required
+                        />
+                      </label>
+                      <button className="button button-primary" type="submit">
+                        <Radio size={16} aria-hidden="true" />
+                        영상 연결
+                      </button>
+                      <span className="fms-security-note">
+                        <LockKeyhole size={14} aria-hidden="true" />
+                        계정·비밀번호·토큰은 GitHub나 서버에 저장하지 않고 이
+                        브라우저 메모리에서만 사용합니다. 음성은 받지 않습니다.
+                      </span>
+                      {fmsConnectionError && (
+                        <p className="fms-connect-error" role="alert">
+                          {fmsConnectionError}
+                        </p>
+                      )}
+                    </form>
+                  )}
+
+                {patrolSource === "robot" &&
+                  (cameraState === "running" ||
+                    cameraState === "starting") && (
+                    <div className="fms-connected-tools">
+                      <span className="fms-stream-status" role="status">
+                        <Radio size={15} aria-hidden="true" />
+                        <strong>{fmsStatusLabel}</strong>
+                        <span>{fmsConnectionMessage}</span>
+                      </span>
+                      {fmsFeeds.length > 0 && (
+                        <label className="fms-track-control">
+                          로봇 카메라
+                          <select
+                            value={selectedFmsFeedId}
+                            onChange={(event) =>
+                              selectFmsFeed(event.target.value)
+                            }
+                          >
+                            {fmsFeeds.map((feed) => (
+                              <option key={feed.id} value={feed.id}>
+                                {feed.trackName || "video"}
+                                {feed.participantName
+                                  ? ` · ${feed.participantName}`
+                                  : ""}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                      {fmsStreamState === "waiting" && (
+                        <button
+                          type="button"
+                          className="button button-ghost"
+                          onClick={() => void resumeFmsVideo()}
+                        >
+                          <Play size={15} aria-hidden="true" />
+                          영상 재생
+                        </button>
+                      )}
+                    </div>
+                  )}
+              </section>
 
               <section
                 className={`camera-card phase-${alertPhase}`}
@@ -2966,13 +3827,21 @@ export default function Home() {
                     <span
                       className={`live-indicator ${cameraState === "running" ? "active" : ""}`}
                     />
-                    <strong>고양 폴리봇 AI 실증 카메라</strong>
-                    <span>모바일 프로토타입</span>
+                    <strong>
+                      {patrolSource === "robot"
+                        ? `고양 폴리봇 ${fmsRobotId} 실시간 카메라`
+                        : "고양 폴리봇 AI 실증 카메라"}
+                    </strong>
+                    <span>
+                      {patrolSource === "robot"
+                        ? "ROBOTIS FMS · WebRTC"
+                        : "모바일 프로토타입"}
+                    </span>
                   </div>
                   <div className="camera-signals">
                     <span>
                       <Wifi size={14} aria-hidden="true" />
-                      기기 내 처리
+                      {patrolSource === "robot" ? "원격 WebRTC" : "현장 카메라"}
                     </span>
                     <span>
                       <EyeOff size={14} aria-hidden="true" />
@@ -3021,20 +3890,42 @@ export default function Home() {
                       <div>
                         <strong>
                           {cameraState === "starting"
-                            ? "휴대폰 안에서 AI를 준비하고 있습니다"
+                            ? patrolSource === "robot"
+                              ? "로봇 실시간 영상과 AI를 연결하고 있습니다"
+                              : "휴대폰 안에서 AI를 준비하고 있습니다"
                             : cameraState === "error"
-                              ? "카메라 연결을 확인해 주세요"
-                              : "고양 폴리봇 AI 감지를 시작합니다"}
+                              ? patrolSource === "robot"
+                                ? "FMS 영상 연결을 확인해 주세요"
+                                : "카메라 연결을 확인해 주세요"
+                              : patrolSource === "robot"
+                                ? "운행 중인 폴리봇 영상을 AI로 분석합니다"
+                                : "고양 폴리봇 AI 감지를 시작합니다"}
                         </strong>
-                        <p>{modelMessage}</p>
+                        <p>
+                          {patrolSource === "robot" &&
+                          fmsConnectionError &&
+                          cameraState === "error"
+                            ? fmsConnectionError
+                            : modelMessage}
+                        </p>
                       </div>
                       {cameraState !== "starting" && (
                         <button
                           className="button button-light"
-                          onClick={startCamera}
+                          onClick={
+                            patrolSource === "robot"
+                              ? () => void startRobotStream()
+                              : startCamera
+                          }
                         >
-                          <Camera size={18} aria-hidden="true" />
-                          AI 카메라 시작
+                          {patrolSource === "robot" ? (
+                            <Radio size={18} aria-hidden="true" />
+                          ) : (
+                            <Camera size={18} aria-hidden="true" />
+                          )}
+                          {patrolSource === "robot"
+                            ? "FMS 영상 연결"
+                            : "AI 카메라 시작"}
                         </button>
                       )}
                     </div>

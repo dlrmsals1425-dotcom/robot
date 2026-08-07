@@ -43,6 +43,8 @@ test("server-renders the Goyang Polybot mobile patrol product", async () => {
   assert.match(html, /SAFEBOT/);
   assert.match(html, /AI 감지 기능을 탑재한 고양 폴리봇/);
   assert.match(html, /폴리봇 AI 감지 시작/);
+  assert.match(html, /휴대폰 카메라/);
+  assert.match(html, /로봇 FMS 영상/);
   assert.match(html, /og-goyang-polybot-v3\.jpg/);
   assert.match(html, /10초 알림 흐름 테스트/);
   assert.match(html, /얼굴 익명화/);
@@ -103,6 +105,8 @@ test("ships the PWA shell and pinned local AI assets", async () => {
   assert.match(serviceWorker, /requestUrl\.pathname\.startsWith\("\/api\/"\)/);
   assert.match(serviceWorker, /requestUrl\.pathname === "\/control"/);
   assert.match(page, /FaceDetector|blaze_face_full_range|얼굴/);
+  assert.match(page, /requestVideoFrameCallback/);
+  assert.doesNotMatch(page, /frameSequence:\s*video\.currentTime/);
   assert.match(
     visionWorker,
     /FilesetResolver\.forVisionTasks\([\s\S]*?true,[\s\S]*?\)/,

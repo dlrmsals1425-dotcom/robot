@@ -21,7 +21,11 @@ type FrameMessage = {
   timestamp: number;
 };
 
-type WorkerMessage = InitMessage | FrameMessage;
+type ResetMessage = {
+  type: "reset";
+};
+
+type WorkerMessage = InitMessage | ResetMessage | FrameMessage;
 
 type PlainDetection = {
   boundingBox?: {
@@ -194,6 +198,12 @@ workerScope.onmessage = async (event: MessageEvent<WorkerMessage>) => {
             : "AI 모델을 준비하지 못했습니다.",
       });
     }
+    return;
+  }
+
+  if (event.data.type === "reset") {
+    cachedObjects = [];
+    lastObjectDetectionAt = -Infinity;
     return;
   }
 
