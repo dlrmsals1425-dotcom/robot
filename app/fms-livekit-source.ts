@@ -1,4 +1,5 @@
 import {
+  DisconnectReason,
   Room,
   RoomEvent,
   Track,
@@ -161,7 +162,6 @@ export class FmsLiveKitVideoSource {
     } catch {
       if (runId === this.runId && this.room === room) {
         this.releaseRoomState(room);
-        this.setState("error");
       } else {
         this.unbindRoom(room);
       }
@@ -279,11 +279,21 @@ export class FmsLiveKitVideoSource {
     this.setState(this.attached ? "live" : "waiting");
   };
 
-  private readonly handleDisconnected = () => {
+  private readonly handleDisconnected = (reason?: DisconnectReason) => {
     const room = this.room;
     if (!room) return;
+    const wasConnected = this.connected;
     this.releaseRoomState(room);
-    this.setState("error");
+    // LiveKit can emit Disconnected before room.connect() rejects. In that
+    // initial-failure path, let connect() surface the actual join error instead
+    // of misreporting it as a previously-live session ending. Deliberate
+    // disconnects are unbound before Room.disconnect() and normally never reach
+    // this callback, but keep the reason guard for SDK/server variations.
+    if (wasConnected && reason !== DisconnectReason.CLIENT_INITIATED) {
+      this.setState("error");
+    } else if (wasConnected) {
+      this.setState("waiting");
+    }
   };
 
   private readonly handleVideoPlaybackStatusChanged = (playing: boolean) => {
@@ -298,6 +308,7 @@ export class FmsLiveKitVideoSource {
       .on(RoomEvent.TrackSubscribed, this.handleTrackSubscribed)
       .on(RoomEvent.TrackUnsubscribed, this.handleTrackUnsubscribed)
       .on(RoomEvent.Reconnecting, this.handleReconnecting)
+      .on(RoomEvent.SignalReconnecting, this.handleReconnecting)
       .on(RoomEvent.Reconnected, this.handleReconnected)
       .on(RoomEvent.Disconnected, this.handleDisconnected)
       .on(
@@ -312,6 +323,7 @@ export class FmsLiveKitVideoSource {
     room.off(RoomEvent.TrackSubscribed, this.handleTrackSubscribed);
     room.off(RoomEvent.TrackUnsubscribed, this.handleTrackUnsubscribed);
     room.off(RoomEvent.Reconnecting, this.handleReconnecting);
+    room.off(RoomEvent.SignalReconnecting, this.handleReconnecting);
     room.off(RoomEvent.Reconnected, this.handleReconnected);
     room.off(RoomEvent.Disconnected, this.handleDisconnected);
     room.off(

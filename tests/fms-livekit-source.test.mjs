@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { RoomEvent, Track } from "livekit-client";
+import { DisconnectReason, RoomEvent, Track } from "livekit-client";
 
 import { FmsLiveKitVideoSource } from "../app/fms-livekit-source.ts";
 
@@ -361,9 +361,80 @@ test("unexpected room disconnection clears media and reports error", async () =>
   const context = await harness([front]);
   await emitSubscribed(context.room, context.participant, front);
 
-  context.room.emit(RoomEvent.Disconnected);
+  context.room.emit(RoomEvent.Disconnected, DisconnectReason.SIGNAL_CLOSE);
   assert.equal(context.states.at(-1), "error");
   assert.equal(context.room.listenerCount(), 0);
   assert.equal(context.mediaStreams.at(-1), null);
   assert.deepEqual(context.source.feeds, []);
+});
+
+test("initial join disconnection is left to connect error handling", async () => {
+  const room = new FakeRoom();
+  room.connect = async function connect(url, token, options) {
+    this.connectCalls.push({ url, token, options });
+    this.emit(RoomEvent.Disconnected, DisconnectReason.JOIN_FAILURE);
+    throw new Error("simulated join failure");
+  };
+  const states = [];
+  const source = new FmsLiveKitVideoSource({
+    video: fakeVideo(),
+    roomFactory: () => room,
+    onState: (state) => states.push(state),
+  });
+
+  await assert.rejects(
+    source.connect({
+      url: "wss://livekit.example.test",
+      token: "short-lived-test-token",
+    }),
+    /FMS 실시간 영상에 연결하지 못했습니다/u,
+  );
+  assert.deepEqual(states, ["connecting"]);
+  assert.equal(room.listenerCount(), 0);
+});
+
+test("direct initial join rejection does not masquerade as a live disconnect", async () => {
+  const room = new FakeRoom();
+  room.connect = async function connect(url, token, options) {
+    this.connectCalls.push({ url, token, options });
+    throw new Error("simulated connection rejection");
+  };
+  const states = [];
+  const source = new FmsLiveKitVideoSource({
+    video: fakeVideo(),
+    roomFactory: () => room,
+    onState: (state) => states.push(state),
+  });
+
+  await assert.rejects(
+    source.connect({
+      url: "wss://livekit.example.test",
+      token: "short-lived-test-token",
+    }),
+    /FMS 실시간 영상에 연결하지 못했습니다/u,
+  );
+  assert.deepEqual(states, ["connecting"]);
+  assert.equal(room.listenerCount(), 0);
+});
+
+test("client-initiated room close does not report a runtime error", async () => {
+  const context = await harness([]);
+
+  context.room.emit(
+    RoomEvent.Disconnected,
+    DisconnectReason.CLIENT_INITIATED,
+  );
+  assert.equal(context.states.at(-1), "waiting");
+  assert.equal(context.states.includes("error"), false);
+  assert.equal(context.room.listenerCount(), 0);
+});
+
+test("signal-only reconnection reports reconnecting without a terminal error", async () => {
+  const context = await harness([]);
+
+  context.room.emit(RoomEvent.SignalReconnecting);
+  assert.equal(context.states.at(-1), "reconnecting");
+  assert.equal(context.states.includes("error"), false);
+  context.room.emit(RoomEvent.Reconnected);
+  assert.equal(context.states.at(-1), "waiting");
 });
