@@ -1,24 +1,24 @@
 {
-  "name": "SAFEBOT 주민안전 AI 순찰",
-  "short_name": "SAFEBOT",
-  "description": "휴대폰 카메라로 사람과 사물을 감지하고 누운 자세를 10초간 확인하는 모바일 안전 순찰 MVP",
+  "name": "고양 폴리봇 SAFEBOT",
+  "short_name": "고양 폴리봇",
+  "description": "사람·사물 감지와 쓰러짐 의심 10초 확인을 검증하는 고양 폴리봇 모바일 AI 관제 프로토타입",
   "lang": "ko-KR",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#f5f7f4",
-  "theme_color": "#10221a",
+  "background_color": "#f5f8fc",
+  "theme_color": "#0b1f36",
   "categories": ["utilities", "productivity"],
   "icons": [
     {
-      "src": "/icons/icon-192.png",
+      "src": "/icons/icon-192-blue-v1.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/icons/icon-512.png",
+      "src": "/icons/icon-512-blue-v1.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any maskable"
@@ -26,12 +26,12 @@
   ],
   "shortcuts": [
     {
-      "name": "라이브 순찰",
-      "short_name": "순찰",
+      "name": "폴리봇 AI 순찰",
+      "short_name": "AI 순찰",
       "url": "/",
       "icons": [
         {
-          "src": "/icons/icon-192.png",
+          "src": "/icons/icon-192-blue-v1.png",
           "sizes": "192x192"
         }
       ]

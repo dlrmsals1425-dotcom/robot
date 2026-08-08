@@ -1,5 +1,16 @@
-const CACHE_NAME = "safebot-shell-v3";
-const APP_SHELL = ["/", "/manifest.webmanifest", "/icons/icon-192.png"];
+const CACHE_NAME = "safebot-shell-v6";
+const APP_SHELL = [
+  "/",
+  "/manifest.webmanifest?theme=blue-v1",
+  "/icons/icon-192-blue-v1.png",
+];
+const APP_SHELL_PATHS = ["/", "/manifest.webmanifest"];
+const STATIC_PREFIXES = [
+  "/assets/",
+  "/icons/",
+  "/models/",
+  "/mediapipe/",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -29,11 +40,23 @@ self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
   const requestUrl = new URL(event.request.url);
   if (requestUrl.origin !== self.location.origin) return;
+  if (
+    requestUrl.pathname.startsWith("/api/") ||
+    requestUrl.pathname === "/control" ||
+    requestUrl.pathname.startsWith("/control/")
+  ) {
+    return;
+  }
+
+  const isStaticAsset =
+    APP_SHELL_PATHS.includes(requestUrl.pathname) ||
+    STATIC_PREFIXES.some((prefix) => requestUrl.pathname.startsWith(prefix));
+  if (!isStaticAsset) return;
 
   event.respondWith(
     fetch(event.request)
       .then((response) => {
-        if (response.ok && requestUrl.pathname !== "/") {
+        if (response.ok) {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
         }
@@ -42,7 +65,12 @@ self.addEventListener("fetch", (event) => {
       .catch(() =>
         caches.match(event.request).then((cached) => {
           if (cached) return cached;
-          if (event.request.mode === "navigate") return caches.match("/");
+          if (
+            event.request.mode === "navigate" &&
+            requestUrl.pathname === "/"
+          ) {
+            return caches.match("/");
+          }
           return Response.error();
         }),
       ),
@@ -64,8 +92,8 @@ self.addEventListener("push", (event) => {
         body:
           payload.body ||
           "현장에서 안전 확인이 필요한 이벤트가 감지되었습니다.",
-        icon: "/icons/icon-192.png",
-        badge: "/icons/icon-192.png",
+        icon: "/icons/icon-192-blue-v1.png",
+        badge: "/icons/icon-192-blue-v1.png",
         tag: payload.tag || "safebot-control-center",
         data: { url: payload.url || "/?event=latest" },
       },

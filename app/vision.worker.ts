@@ -8,6 +8,7 @@ import {
   type Detection,
   type NormalizedLandmark,
 } from "@mediapipe/tasks-vision";
+import { deduplicatePoseDetections } from "./person-detection";
 
 type InitMessage = {
   type: "init";
@@ -20,7 +21,11 @@ type FrameMessage = {
   timestamp: number;
 };
 
-type WorkerMessage = InitMessage | FrameMessage;
+type ResetMessage = {
+  type: "reset";
+};
+
+type WorkerMessage = InitMessage | ResetMessage | FrameMessage;
 
 type PlainDetection = {
   boundingBox?: {
@@ -41,6 +46,7 @@ let faceDetector: FaceDetector | null = null;
 let objectDetector: ObjectDetector | null = null;
 let lastObjectDetectionAt = -Infinity;
 let cachedObjects: PlainDetection[] = [];
+const OBJECT_DETECTION_INTERVAL_MS = 400;
 
 function createTaskCanvas() {
   if (typeof OffscreenCanvas === "undefined") {
@@ -96,9 +102,9 @@ async function initialize(baseUrl: string) {
       },
       runningMode: "VIDEO",
       numPoses: 2,
-      minPoseDetectionConfidence: 0.52,
-      minPosePresenceConfidence: 0.52,
-      minTrackingConfidence: 0.5,
+      minPoseDetectionConfidence: 0.6,
+      minPosePresenceConfidence: 0.6,
+      minTrackingConfidence: 0.55,
       outputSegmentationMasks: false,
     }),
     FaceDetector.createFromOptions(vision, {
@@ -140,9 +146,15 @@ function analyzeFrame(message: FrameMessage) {
   try {
     const poseResult = poseLandmarker.detectForVideo(frame, timestamp);
     const faceResult = faceDetector.detectForVideo(frame, timestamp);
+    const serializedPoses = serializePoses(poseResult.landmarks);
+    const uniquePoses = deduplicatePoseDetections(
+      serializedPoses,
+      frame.width,
+      frame.height,
+    ).map((candidate) => serializedPoses[candidate.poseIndex]);
     let objectUpdated = false;
 
-    if (timestamp - lastObjectDetectionAt >= 850) {
+    if (timestamp - lastObjectDetectionAt >= OBJECT_DETECTION_INTERVAL_MS) {
       const objectResult = objectDetector.detectForVideo(frame, timestamp);
       cachedObjects = serializeDetections(objectResult.detections);
       lastObjectDetectionAt = timestamp;
@@ -154,7 +166,7 @@ function analyzeFrame(message: FrameMessage) {
       timestamp,
       frameWidth: frame.width,
       frameHeight: frame.height,
-      poses: serializePoses(poseResult.landmarks),
+      poses: uniquePoses,
       faces: serializeDetections(faceResult.detections),
       objects: cachedObjects,
       objectUpdated,
@@ -186,6 +198,12 @@ workerScope.onmessage = async (event: MessageEvent<WorkerMessage>) => {
             : "AI 모델을 준비하지 못했습니다.",
       });
     }
+    return;
+  }
+
+  if (event.data.type === "reset") {
+    cachedObjects = [];
+    lastObjectDetectionAt = -Infinity;
     return;
   }
 

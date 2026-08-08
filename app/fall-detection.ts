@@ -1,3 +1,5 @@
+import { analyzePoseHumanEvidence } from "./person-detection.ts";
+
 export type PosePoint = {
   x: number;
   y: number;
@@ -17,6 +19,10 @@ export type FallAnalysis = {
   center: PoseCenter | null;
 };
 
+export type FallAnalysisOptions = {
+  hasCorroboratingHumanEvidence?: boolean;
+};
+
 export type VerificationProgress = {
   confirmedMs: number;
   negativeBudgetMs: number;
@@ -31,6 +37,27 @@ export const FALL_NEGATIVE_BUDGET_MS = 650;
 const CORE_LANDMARKS = [11, 12, 23, 24] as const;
 const LEFT_LEG = [23, 25, 27] as const;
 const RIGHT_LEG = [24, 26, 28] as const;
+const BODY_LANDMARKS = [
+  0,
+  7,
+  8,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  30,
+  31,
+  32,
+] as const;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -45,15 +72,20 @@ function isReliablePoint(point: PosePoint | undefined, minVisibility: number) {
   );
 }
 
-function getBodyBounds(pose: PosePoint[], landmarkIndexes: readonly number[]) {
+function getBodyBounds(
+  pose: readonly PosePoint[],
+  landmarkIndexes: readonly number[],
+  frameWidth: number,
+  frameHeight: number,
+) {
   const visible = landmarkIndexes.map((index) => pose[index]).filter(
     (point): point is PosePoint => isReliablePoint(point, 0.55),
   );
 
   if (visible.length < 6) return null;
 
-  const xs = visible.map((point) => point.x);
-  const ys = visible.map((point) => point.y);
+  const xs = visible.map((point) => point.x * frameWidth);
+  const ys = visible.map((point) => point.y * frameHeight);
   return {
     minX: Math.min(...xs),
     maxX: Math.max(...xs),
@@ -131,7 +163,12 @@ export function updateVerificationProgress(
   };
 }
 
-export function analyzeFallPose(pose: PosePoint[]): FallAnalysis {
+export function analyzeFallPose(
+  pose: readonly PosePoint[],
+  frameWidth: number,
+  frameHeight: number,
+  options: FallAnalysisOptions = {},
+): FallAnalysis {
   if (
     !CORE_LANDMARKS.every((index) => isReliablePoint(pose[index], 0.65))
   ) {
@@ -174,8 +211,7 @@ export function analyzeFallPose(pose: PosePoint[]): FallAnalysis {
     };
   }
 
-  const torsoLength = Math.hypot(hip.x - shoulder.x, hip.y - shoulder.y);
-  if (torsoLength < 0.06) {
+  if (frameWidth <= 0 || frameHeight <= 0) {
     return {
       isLying: false,
       isUpright: false,
@@ -184,8 +220,26 @@ export function analyzeFallPose(pose: PosePoint[]): FallAnalysis {
     };
   }
 
-  const bodyLandmarks = [...new Set([...CORE_LANDMARKS, ...completeLeg])];
-  const bounds = getBodyBounds(pose, bodyLandmarks);
+  const torsoLength = Math.hypot(
+    (hip.x - shoulder.x) * frameWidth,
+    (hip.y - shoulder.y) * frameHeight,
+  );
+  if (torsoLength < Math.min(frameWidth, frameHeight) * 0.045) {
+    return {
+      isLying: false,
+      isUpright: false,
+      confidence: 0,
+      center: hip,
+    };
+  }
+
+  const bodyLandmarks = [...new Set([...BODY_LANDMARKS, ...completeLeg])];
+  const bounds = getBodyBounds(
+    pose,
+    bodyLandmarks,
+    frameWidth,
+    frameHeight,
+  );
   if (!bounds) {
     return {
       isLying: false,
@@ -198,8 +252,8 @@ export function analyzeFallPose(pose: PosePoint[]): FallAnalysis {
   const width = Math.max(bounds.maxX - bounds.minX, 0.001);
   const height = Math.max(bounds.maxY - bounds.minY, 0.001);
   const aspectRatio = width / height;
-  const dx = Math.abs(hip.x - shoulder.x);
-  const dy = Math.abs(hip.y - shoulder.y);
+  const dx = Math.abs(hip.x - shoulder.x) * frameWidth;
+  const dy = Math.abs(hip.y - shoulder.y) * frameHeight;
   const angleFromHorizontal =
     (Math.atan2(dy, Math.max(dx, 0.0001)) * 180) / Math.PI;
   const averageCoreVisibility =
@@ -208,39 +262,54 @@ export function analyzeFallPose(pose: PosePoint[]): FallAnalysis {
       0,
     ) / CORE_LANDMARKS.length;
 
-  const horizontalScore = clamp((42 - angleFromHorizontal) / 30, 0, 1);
-  const aspectScore = clamp((aspectRatio - 1) / 0.8, 0, 1);
-  const lowerFrameScore = clamp((hip.y - 0.45) / 0.3, 0, 1);
-  const qualityScore = clamp((averageCoreVisibility - 0.6) / 0.35, 0, 1);
-  const confidence = clamp(
-    0.38 +
-      horizontalScore * 0.25 +
-      aspectScore * 0.18 +
-      lowerFrameScore * 0.11 +
-      qualityScore * 0.08,
+  const humanEvidence = analyzePoseHumanEvidence(
+    pose,
+    frameWidth,
+    frameHeight,
+  );
+  const humanIsConfirmed =
+    humanEvidence.isStrong ||
+    (Boolean(options.hasCorroboratingHumanEvidence) &&
+      humanEvidence.isPlausible);
+  const horizontalScore = clamp((38 - angleFromHorizontal) / 25, 0, 1);
+  const aspectScore = clamp((aspectRatio - 1.15) / 1.1, 0, 1);
+  const lowerFrameScore = clamp((hip.y - 0.48) / 0.28, 0, 1);
+  const qualityScore = clamp((averageCoreVisibility - 0.62) / 0.32, 0, 1);
+  const rawConfidence = clamp(
+    horizontalScore * 0.3 +
+      aspectScore * 0.22 +
+      lowerFrameScore * 0.16 +
+      qualityScore * 0.1 +
+      humanEvidence.score * 0.22,
     0,
     1,
   );
+  const confidence = humanIsConfirmed
+    ? rawConfidence
+    : Math.min(rawConfidence, 0.55);
 
   const bodyIsClipped = bodyLandmarks.some(
     (index) =>
-      pose[index].x < -0.04 ||
-      pose[index].x > 1.04 ||
-      pose[index].y < -0.04 ||
-      pose[index].y > 1.04,
+      isReliablePoint(pose[index], 0.55) &&
+      (pose[index].x < -0.04 ||
+        pose[index].x > 1.04 ||
+        pose[index].y < -0.04 ||
+        pose[index].y > 1.04),
   );
   const isLying =
     !bodyIsClipped &&
-    angleFromHorizontal < 30 &&
-    aspectRatio > 1.2 &&
+    humanIsConfirmed &&
+    angleFromHorizontal < 28 &&
+    aspectRatio > 1.35 &&
     hip.y > 0.52 &&
-    bounds.maxY > 0.62 &&
-    confidence >= 0.7;
+    bounds.maxY / frameHeight > 0.62 &&
+    confidence >= 0.78;
   const isUpright =
     !bodyIsClipped &&
-    angleFromHorizontal > 55 &&
-    aspectRatio < 0.9 &&
-    height > 0.18;
+    humanEvidence.isPlausible &&
+    angleFromHorizontal > 58 &&
+    aspectRatio < 0.95 &&
+    height / frameHeight > 0.18;
 
   return {
     isLying,
